@@ -34,7 +34,6 @@ struct PrDetails {
 #[derive(Debug)]
 enum ExistingWorktreeAction {
     UseExisting,
-    ResetToLatest,
     CreateNew,
 }
 
@@ -112,13 +111,6 @@ fn run() -> Result<(), String> {
 
         match action {
             ExistingWorktreeAction::UseExisting => {
-                println!(
-                    "{} Using existing worktree as-is",
-                    "→".blue().bold()
-                );
-                existing_path
-            }
-            ExistingWorktreeAction::ResetToLatest => {
                 print!("{} Updating to latest... ", "→".blue().bold());
                 std::io::stdout().flush().ok();
                 update_worktree(&existing_path, &pr_details.head_ref_name)?;
@@ -220,21 +212,20 @@ fn has_uncommitted_changes(worktree_path: &PathBuf) -> Result<bool, String> {
 
 fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktreeAction, String> {
     println!();
-    println!("  {} Use existing worktree as-is", "[1]".cyan().bold());
     if has_changes {
         println!(
-            "  {} Reset to latest {} (will discard changes!)",
-            "[2]".cyan().bold(),
-            "".dimmed()
+            "  {} Use existing worktree {}",
+            "[1]".cyan().bold(),
+            "(will discard uncommitted changes!)".yellow()
         );
     } else {
-        println!("  {} Reset to latest from remote", "[2]".cyan().bold());
+        println!("  {} Use existing worktree", "[1]".cyan().bold());
     }
-    println!("  {} Create new worktree", "[3]".cyan().bold());
+    println!("  {} Create new worktree", "[2]".cyan().bold());
     println!();
 
     loop {
-        print!("{} Choose an option [1/2/3]: ", "?".magenta().bold());
+        print!("{} Choose an option [1/2]: ", "?".magenta().bold());
         io::stdout().flush().map_err(|e| e.to_string())?;
 
         let mut input = String::new();
@@ -243,8 +234,7 @@ fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktree
             .map_err(|e| format!("Failed to read input: {}", e))?;
 
         match input.trim() {
-            "1" => return Ok(ExistingWorktreeAction::UseExisting),
-            "2" => {
+            "1" => {
                 if has_changes {
                     print!(
                         "{} Are you sure you want to discard changes? [y/N]: ",
@@ -257,18 +247,16 @@ fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktree
                         .read_line(&mut confirm)
                         .map_err(|e| format!("Failed to read input: {}", e))?;
 
-                    if confirm.trim().to_lowercase() == "y" {
-                        return Ok(ExistingWorktreeAction::ResetToLatest);
-                    } else {
+                    if confirm.trim().to_lowercase() != "y" {
                         println!("{} Cancelled", "→".blue().bold());
                         continue;
                     }
                 }
-                return Ok(ExistingWorktreeAction::ResetToLatest);
+                return Ok(ExistingWorktreeAction::UseExisting);
             }
-            "3" => return Ok(ExistingWorktreeAction::CreateNew),
+            "2" => return Ok(ExistingWorktreeAction::CreateNew),
             _ => {
-                println!("{} Invalid option, please enter 1, 2, or 3", "!".red().bold());
+                println!("{} Invalid option, please enter 1 or 2", "!".red().bold());
             }
         }
     }
