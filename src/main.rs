@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use colored::Colorize;
 use regex::Regex;
 use serde::Deserialize;
@@ -24,20 +24,42 @@ const COLOR_PALETTE: &[&str] = &[
 ];
 
 #[derive(Parser)]
-#[command(name = "checkout-pr")]
-#[command(about = "Create a worktree for a GitHub PR and spawn claude to review it")]
+#[command(name = "checkout")]
+#[command(about = "Create git worktrees for PRs or new branches")]
 #[command(version)]
-struct Args {
-    /// PR number or GitHub PR URL (e.g., 123 or https://github.com/figma/figma/pull/123)
-    pr: String,
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// Skip spawning claude after creating the worktree
-    #[arg(long)]
-    no_claude: bool,
+#[derive(Subcommand)]
+enum Commands {
+    /// Check out a GitHub PR into a worktree
+    Pr {
+        /// PR number or GitHub PR URL (e.g., 123 or https://github.com/figma/figma/pull/123)
+        pr: String,
 
-    /// Path to the main figma repo (default: ~/figma/figma)
-    #[arg(long)]
-    repo: Option<PathBuf>,
+        /// Skip spawning claude after creating the worktree
+        #[arg(long)]
+        no_claude: bool,
+
+        /// Path to the main figma repo (default: ~/figma/figma)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Create a new branch in a worktree
+    Branch {
+        /// Branch name (will be prefixed with darren/ if not already)
+        name: String,
+
+        /// Skip spawning claude after creating the worktree
+        #[arg(long)]
+        no_claude: bool,
+
+        /// Path to the main figma repo (default: ~/figma/figma)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -61,48 +83,40 @@ fn main() {
 }
 
 /// Set iTerm2 background color using proprietary escape sequence.
-/// Color format is hex RGB (e.g., "1a1a2e" for a slightly blue-tinted dark background)
 fn set_iterm_background(hex_color: &str) {
-    // iTerm2 escape sequence: OSC 1337 ; SetColors=bg=RRGGBB BEL
     print!("\x1b]1337;SetColors=bg={}\x07", hex_color);
+    std::io::stdout().flush().ok();
+}
+
+/// Reset iTerm2 background to default
+fn reset_iterm_background() {
+    print!("\x1b]1337;SetColors=bg=default\x07");
     std::io::stdout().flush().ok();
 }
 
 /// Set iTerm2 tab title
 fn set_iterm_tab_title(title: &str) {
-    // OSC 1 sets the tab title
     print!("\x1b]1;{}\x07", title);
     std::io::stdout().flush().ok();
 }
 
 /// Reset iTerm2 tab title to default
 fn reset_iterm_tab_title() {
-    // Empty title resets to default behavior
     print!("\x1b]1;\x07");
-    std::io::stdout().flush().ok();
-}
-
-/// Reset iTerm2 background to default
-fn reset_iterm_background() {
-    // Reset to default by using empty value
-    print!("\x1b]1337;SetColors=bg=default\x07");
     std::io::stdout().flush().ok();
 }
 
 const COLOR_FILE: &str = ".checkout-pr-color";
 
-/// Get the color assigned to a worktree, if any
 fn get_worktree_color(worktree_path: &PathBuf) -> Option<String> {
     let color_file = worktree_path.join(COLOR_FILE);
     fs::read_to_string(color_file).ok().map(|s| s.trim().to_string())
 }
 
-/// Save the color assignment for a worktree
 fn save_worktree_color(worktree_path: &PathBuf, color: &str) -> Result<(), String> {
     let color_file = worktree_path.join(COLOR_FILE);
     fs::write(&color_file, color).map_err(|e| format!("Failed to save color: {}", e))?;
 
-    // Add to .git/info/exclude if not already there
     let exclude_file = worktree_path.join(".git/info/exclude");
     if exclude_file.exists() {
         if let Ok(content) = fs::read_to_string(&exclude_file) {
@@ -116,7 +130,6 @@ fn save_worktree_color(worktree_path: &PathBuf, color: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// Get colors currently in use by other worktrees
 fn get_used_colors(worktree_dir: &PathBuf) -> HashSet<String> {
     let mut used = HashSet::new();
 
@@ -134,49 +147,47 @@ fn get_used_colors(worktree_dir: &PathBuf) -> HashSet<String> {
     used
 }
 
-/// Pick a color that's not in use, or a random one if all are taken
 fn pick_available_color(worktree_dir: &PathBuf, current_worktree: &PathBuf) -> String {
-    // Check if this worktree already has a color
     if let Some(existing) = get_worktree_color(current_worktree) {
         return existing;
     }
 
     let used = get_used_colors(worktree_dir);
 
-    // Find first unused color
     for color in COLOR_PALETTE {
         if !used.contains(*color) {
             return color.to_string();
         }
     }
 
-    // All colors used, pick based on hash of path
     let hash = current_worktree.to_string_lossy().bytes().fold(0usize, |acc, b| acc.wrapping_add(b as usize));
     COLOR_PALETTE[hash % COLOR_PALETTE.len()].to_string()
 }
 
 fn run() -> Result<(), String> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    // Extract PR number
-    let pr_number = extract_pr_number(&args.pr)?;
+    match cli.command {
+        Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo),
+        Commands::Branch { name, no_claude, repo } => run_branch(&name, no_claude, repo),
+    }
+}
+
+fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String> {
+    let pr_number = extract_pr_number(pr)?;
     println!(
         "{} PR #{}",
         "→".blue().bold(),
         pr_number.to_string().cyan()
     );
 
-    // Get repo root
     let home = env::var("HOME").map_err(|_| "HOME not set")?;
-    let repo_root = args
-        .repo
-        .unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
+    let repo_root = repo.unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
 
     if !repo_root.exists() {
         return Err(format!("Repo not found at {}", repo_root.display()));
     }
 
-    // Fetch PR details
     print!("{} Fetching PR details... ", "→".blue().bold());
     std::io::stdout().flush().ok();
     let pr_details = fetch_pr_details(pr_number)?;
@@ -193,13 +204,11 @@ fn run() -> Result<(), String> {
         pr_details.head_ref_name.yellow()
     );
 
-    // Create slug from title
     let slug = create_slug(&pr_details.title);
     let worktree_dir = PathBuf::from(format!("{}/figma-worktrees", home));
     let worktree_path = worktree_dir.join(format!("pr-{}-{}", pr_number, slug));
 
-    // Check for existing worktree
-    let existing = find_existing_worktree(&repo_root, pr_number)?;
+    let existing = find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?;
 
     let final_path = if let Some(existing_path) = existing {
         println!(
@@ -208,7 +217,6 @@ fn run() -> Result<(), String> {
             existing_path.display().to_string().cyan()
         );
 
-        // Check for uncommitted changes
         let has_changes = has_uncommitted_changes(&existing_path)?;
         if has_changes {
             println!(
@@ -229,14 +237,13 @@ fn run() -> Result<(), String> {
                 existing_path
             }
             ExistingWorktreeAction::CreateNew => {
-                // Find next available suffix
-                let new_path = find_next_worktree_path(&worktree_dir, pr_number, &slug)?;
-                create_new_worktree(&repo_root, &worktree_dir, &new_path, &pr_details.head_ref_name)?;
+                let new_path = find_next_worktree_path(&worktree_dir, &format!("pr-{}-{}", pr_number, slug))?;
+                create_new_worktree_from_remote(&repo_root, &worktree_dir, &new_path, &pr_details.head_ref_name)?;
                 new_path
             }
         }
     } else {
-        create_new_worktree(&repo_root, &worktree_dir, &worktree_path, &pr_details.head_ref_name)?;
+        create_new_worktree_from_remote(&repo_root, &worktree_dir, &worktree_path, &pr_details.head_ref_name)?;
         worktree_path
     };
 
@@ -247,7 +254,7 @@ fn run() -> Result<(), String> {
         final_path.display().to_string().cyan().bold()
     );
 
-    if args.no_claude {
+    if no_claude {
         println!(
             "\n{} Run: {} {} {}",
             "tip:".yellow().bold(),
@@ -264,22 +271,19 @@ fn run() -> Result<(), String> {
         );
         println!();
 
-        // Set up iTerm session appearance
         let bg_color = pick_available_color(&worktree_dir, &final_path);
         save_worktree_color(&final_path, &bg_color)?;
         set_iterm_background(&bg_color);
         set_iterm_tab_title(&format!("{} [WORKTREE]", pr_details.head_ref_name));
 
-        // Open editors
         print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
         std::io::stdout().flush().ok();
         open_cursor(&final_path)?;
         open_sublime_merge(&final_path)?;
         println!("{}", "done".green());
 
-        let result = spawn_claude(&final_path, pr_number);
+        let result = spawn_claude_pr(&final_path, pr_number);
 
-        // Reset iTerm session appearance when done
         reset_iterm_background();
         reset_iterm_tab_title();
 
@@ -289,17 +293,122 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn create_new_worktree(
+fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String> {
+    // Ensure branch name has darren/ prefix
+    let branch_name = if name.starts_with("darren/") {
+        name.to_string()
+    } else {
+        format!("darren/{}", name)
+    };
+
+    println!(
+        "{} Branch {}",
+        "→".blue().bold(),
+        branch_name.cyan()
+    );
+
+    let home = env::var("HOME").map_err(|_| "HOME not set")?;
+    let repo_root = repo.unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
+
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+
+    // Create slug from branch name (remove darren/ prefix for the slug)
+    let slug = branch_name.strip_prefix("darren/").unwrap_or(&branch_name);
+    let worktree_dir = PathBuf::from(format!("{}/figma-worktrees", home));
+    let worktree_path = worktree_dir.join(format!("branch-{}", slug));
+
+    // Check if worktree already exists
+    let existing = find_existing_worktree(&repo_root, &format!("branch-{}", slug))?;
+
+    let final_path = if let Some(existing_path) = existing {
+        println!(
+            "\n{} Worktree already exists at {}",
+            "!".yellow().bold(),
+            existing_path.display().to_string().cyan()
+        );
+
+        let has_changes = has_uncommitted_changes(&existing_path)?;
+        if has_changes {
+            println!(
+                "  {} {}",
+                "⚠".yellow().bold(),
+                "Worktree has uncommitted changes!".yellow()
+            );
+        }
+
+        let action = prompt_existing_worktree_action(has_changes)?;
+
+        match action {
+            ExistingWorktreeAction::UseExisting => {
+                existing_path
+            }
+            ExistingWorktreeAction::CreateNew => {
+                let new_path = find_next_worktree_path(&worktree_dir, &format!("branch-{}", slug))?;
+                create_new_worktree_new_branch(&repo_root, &worktree_dir, &new_path, &branch_name)?;
+                new_path
+            }
+        }
+    } else {
+        create_new_worktree_new_branch(&repo_root, &worktree_dir, &worktree_path, &branch_name)?;
+        worktree_path
+    };
+
+    println!();
+    println!(
+        "{} Worktree ready at {}",
+        "✓".green().bold(),
+        final_path.display().to_string().cyan().bold()
+    );
+
+    if no_claude {
+        println!(
+            "\n{} Run: {} {} {}",
+            "tip:".yellow().bold(),
+            "cd".dimmed(),
+            final_path.display(),
+            "&& claude".dimmed()
+        );
+    } else {
+        println!();
+        println!(
+            "{} Spawning claude...",
+            "→".blue().bold(),
+        );
+        println!();
+
+        let bg_color = pick_available_color(&worktree_dir, &final_path);
+        save_worktree_color(&final_path, &bg_color)?;
+        set_iterm_background(&bg_color);
+        set_iterm_tab_title(&format!("{} [WORKTREE]", branch_name));
+
+        print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
+        std::io::stdout().flush().ok();
+        open_cursor(&final_path)?;
+        open_sublime_merge(&final_path)?;
+        println!("{}", "done".green());
+
+        let result = spawn_claude(&final_path);
+
+        reset_iterm_background();
+        reset_iterm_tab_title();
+
+        result?;
+    }
+
+    Ok(())
+}
+
+fn create_new_worktree_from_remote(
     repo_root: &PathBuf,
     worktree_dir: &PathBuf,
     worktree_path: &PathBuf,
     branch: &str,
 ) -> Result<(), String> {
-    // Create worktrees directory
     std::fs::create_dir_all(worktree_dir)
         .map_err(|e| format!("Failed to create worktrees dir: {}", e))?;
 
-    // Fetch the branch
     print!(
         "{} Fetching branch {}... ",
         "→".blue().bold(),
@@ -309,23 +418,61 @@ fn create_new_worktree(
     fetch_branch(repo_root, branch)?;
     println!("{}", "done".green());
 
-    // Create worktree
     print!(
         "{} Creating worktree at {}... ",
         "→".blue().bold(),
         worktree_path.display().to_string().cyan()
     );
     std::io::stdout().flush().ok();
-    create_worktree(repo_root, worktree_path, branch)?;
+    create_worktree_from_ref(repo_root, worktree_path, &format!("origin/{}", branch))?;
     println!("{}", "done".green());
 
-    // Run mise trust
     if which_mise().is_some() {
         print!("{} Running mise trust... ", "→".blue().bold());
         std::io::stdout().flush().ok();
         run_mise_trust(worktree_path)?;
         println!("{}", "done".green());
     }
+
+    Ok(())
+}
+
+fn create_new_worktree_new_branch(
+    repo_root: &PathBuf,
+    worktree_dir: &PathBuf,
+    worktree_path: &PathBuf,
+    branch: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(worktree_dir)
+        .map_err(|e| format!("Failed to create worktrees dir: {}", e))?;
+
+    // Fetch latest master
+    print!("{} Fetching latest master... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    fetch_branch(repo_root, "master")?;
+    println!("{}", "done".green());
+
+    print!(
+        "{} Creating worktree with new branch {}... ",
+        "→".blue().bold(),
+        branch.yellow()
+    );
+    std::io::stdout().flush().ok();
+    create_worktree_new_branch(repo_root, worktree_path, branch)?;
+    println!("{}", "done".green());
+
+    if which_mise().is_some() {
+        print!("{} Running mise trust... ", "→".blue().bold());
+        std::io::stdout().flush().ok();
+        run_mise_trust(worktree_path)?;
+        println!("{}", "done".green());
+    }
+
+    // Track with graphite
+    print!("{} Tracking with Graphite... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    run_gt_track(worktree_path)?;
+    println!("{}", "done".green());
 
     Ok(())
 }
@@ -392,10 +539,7 @@ fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktree
     }
 }
 
-fn find_next_worktree_path(worktree_dir: &PathBuf, pr_number: u64, slug: &str) -> Result<PathBuf, String> {
-    let base_name = format!("pr-{}-{}", pr_number, slug);
-
-    // Check existing worktrees to find next available suffix
+fn find_next_worktree_path(worktree_dir: &PathBuf, base_name: &str) -> Result<PathBuf, String> {
     let mut suffix = 2;
     loop {
         let candidate = worktree_dir.join(format!("{}-{}", base_name, suffix));
@@ -404,18 +548,16 @@ fn find_next_worktree_path(worktree_dir: &PathBuf, pr_number: u64, slug: &str) -
         }
         suffix += 1;
         if suffix > 100 {
-            return Err("Too many worktrees for this PR".to_string());
+            return Err("Too many worktrees".to_string());
         }
     }
 }
 
 fn extract_pr_number(input: &str) -> Result<u64, String> {
-    // Try direct number
     if let Ok(num) = input.parse::<u64>() {
         return Ok(num);
     }
 
-    // Try URL pattern
     let re = Regex::new(r"/pull/(\d+)").unwrap();
     if let Some(caps) = re.captures(input) {
         if let Some(m) = caps.get(1) {
@@ -448,26 +590,22 @@ fn fetch_pr_details(pr_number: u64) -> Result<PrDetails, String> {
 }
 
 fn create_slug(title: &str) -> String {
-    // Remove prefix like "multiplayer: " or "web: "
     let without_prefix = if let Some(idx) = title.find(": ") {
         &title[idx + 2..]
     } else {
         title
     };
 
-    // Convert to lowercase, replace non-alphanumeric with hyphens, take first 4 words
     let slug: String = without_prefix
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
         .collect();
 
-    // Clean up multiple hyphens and trim
     let re = Regex::new(r"-+").unwrap();
     let cleaned = re.replace_all(&slug, "-");
     let trimmed = cleaned.trim_matches('-');
 
-    // Take first 4 segments
     trimmed
         .split('-')
         .filter(|s| !s.is_empty())
@@ -476,17 +614,16 @@ fn create_slug(title: &str) -> String {
         .join("-")
 }
 
-fn find_existing_worktree(repo_root: &PathBuf, pr_number: u64) -> Result<Option<PathBuf>, String> {
+fn find_existing_worktree(repo_root: &PathBuf, pattern: &str) -> Result<Option<PathBuf>, String> {
     let output = Command::new("git")
         .args(["-C", &repo_root.to_string_lossy(), "worktree", "list"])
         .output()
         .map_err(|e| format!("Failed to list worktrees: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pattern = format!("pr-{}-", pr_number);
 
     for line in stdout.lines() {
-        if line.contains(&pattern) {
+        if line.contains(pattern) {
             if let Some(path) = line.split_whitespace().next() {
                 return Ok(Some(PathBuf::from(path)));
             }
@@ -511,9 +648,7 @@ fn fetch_branch(repo_root: &PathBuf, branch: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn create_worktree(repo_root: &PathBuf, worktree_path: &PathBuf, branch: &str) -> Result<(), String> {
-    let ref_name = format!("origin/{}", branch);
-
+fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_ref: &str) -> Result<(), String> {
     let status = Command::new("git")
         .args([
             "-C",
@@ -521,7 +656,7 @@ fn create_worktree(repo_root: &PathBuf, worktree_path: &PathBuf, branch: &str) -
             "worktree",
             "add",
             &worktree_path.to_string_lossy(),
-            &ref_name,
+            git_ref,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -552,8 +687,31 @@ fn create_worktree(repo_root: &PathBuf, worktree_path: &PathBuf, branch: &str) -
     Ok(())
 }
 
+fn create_worktree_new_branch(repo_root: &PathBuf, worktree_path: &PathBuf, branch: &str) -> Result<(), String> {
+    let status = Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            &worktree_path.to_string_lossy(),
+            "origin/master",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to create worktree: {}", e))?;
+
+    if !status.success() {
+        return Err("git worktree add failed".to_string());
+    }
+
+    Ok(())
+}
+
 fn update_worktree(worktree_path: &PathBuf, branch: &str) -> Result<(), String> {
-    // Fetch
     let status = Command::new("git")
         .args(["-C", &worktree_path.to_string_lossy(), "fetch", "origin", branch])
         .stdout(Stdio::null())
@@ -565,7 +723,6 @@ fn update_worktree(worktree_path: &PathBuf, branch: &str) -> Result<(), String> 
         return Err("git fetch failed".to_string());
     }
 
-    // Reset
     let ref_name = format!("origin/{}", branch);
     let status = Command::new("git")
         .args([
@@ -612,6 +769,22 @@ fn run_mise_trust(worktree_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn run_gt_track(worktree_path: &PathBuf) -> Result<(), String> {
+    let status = Command::new("gt")
+        .args(["track", "--no-interactive"])
+        .current_dir(worktree_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to run gt track: {}", e))?;
+
+    if !status.success() {
+        return Err("gt track failed".to_string());
+    }
+
+    Ok(())
+}
+
 fn open_cursor(worktree_path: &PathBuf) -> Result<(), String> {
     Command::new("cursor")
         .arg(worktree_path)
@@ -634,15 +807,28 @@ fn open_sublime_merge(worktree_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_claude(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String> {
+fn spawn_claude_pr(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String> {
     let prompt = format!("/darren:checkout-pr {}", pr_number);
 
-    // Use shell to cd first, ensuring claude starts in the right directory
     let cmd = format!(
         "cd '{}' && claude '{}'",
         worktree_path.display(),
         prompt
     );
+    let status = Command::new("bash")
+        .args(["-c", &cmd])
+        .status()
+        .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+
+    if !status.success() {
+        return Err("claude exited with error".to_string());
+    }
+
+    Ok(())
+}
+
+fn spawn_claude(worktree_path: &PathBuf) -> Result<(), String> {
+    let cmd = format!("cd '{}' && claude", worktree_path.display());
     let status = Command::new("bash")
         .args(["-c", &cmd])
         .status()

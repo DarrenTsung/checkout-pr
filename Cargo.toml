@@ -1,10 +1,10 @@
 [package]
-name = "checkout_pr"
+name = "checkout"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "checkout-pr"
+name = "checkout"
 path = "src/main.rs"
 
 [dependencies]
