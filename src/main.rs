@@ -2,10 +2,26 @@ use clap::Parser;
 use colored::Colorize;
 use regex::Regex;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::env;
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+/// Color palette - subtle dark backgrounds with different hues
+const COLOR_PALETTE: &[&str] = &[
+    "1a1a2e", // blue-ish
+    "1a2e1a", // green-ish
+    "2e1a1a", // red-ish
+    "2e2e1a", // yellow-ish
+    "2e1a2e", // purple-ish
+    "1a2e2e", // cyan-ish
+    "251a2e", // magenta-ish
+    "1a252e", // teal-ish
+    "2e251a", // orange-ish
+    "1e1a2e", // indigo-ish
+];
 
 #[derive(Parser)]
 #[command(name = "checkout-pr")]
@@ -57,6 +73,72 @@ fn reset_iterm_background() {
     // Reset to default by using empty value
     print!("\x1b]1337;SetColors=bg=default\x07");
     std::io::stdout().flush().ok();
+}
+
+const COLOR_FILE: &str = ".checkout-pr-color";
+
+/// Get the color assigned to a worktree, if any
+fn get_worktree_color(worktree_path: &PathBuf) -> Option<String> {
+    let color_file = worktree_path.join(COLOR_FILE);
+    fs::read_to_string(color_file).ok().map(|s| s.trim().to_string())
+}
+
+/// Save the color assignment for a worktree
+fn save_worktree_color(worktree_path: &PathBuf, color: &str) -> Result<(), String> {
+    let color_file = worktree_path.join(COLOR_FILE);
+    fs::write(&color_file, color).map_err(|e| format!("Failed to save color: {}", e))?;
+
+    // Add to .git/info/exclude if not already there
+    let exclude_file = worktree_path.join(".git/info/exclude");
+    if exclude_file.exists() {
+        if let Ok(content) = fs::read_to_string(&exclude_file) {
+            if !content.contains(COLOR_FILE) {
+                let new_content = format!("{}\n{}", content.trim_end(), COLOR_FILE);
+                fs::write(&exclude_file, new_content).ok();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Get colors currently in use by other worktrees
+fn get_used_colors(worktree_dir: &PathBuf) -> HashSet<String> {
+    let mut used = HashSet::new();
+
+    if let Ok(entries) = fs::read_dir(worktree_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(color) = get_worktree_color(&path) {
+                    used.insert(color);
+                }
+            }
+        }
+    }
+
+    used
+}
+
+/// Pick a color that's not in use, or a random one if all are taken
+fn pick_available_color(worktree_dir: &PathBuf, current_worktree: &PathBuf) -> String {
+    // Check if this worktree already has a color
+    if let Some(existing) = get_worktree_color(current_worktree) {
+        return existing;
+    }
+
+    let used = get_used_colors(worktree_dir);
+
+    // Find first unused color
+    for color in COLOR_PALETTE {
+        if !used.contains(*color) {
+            return color.to_string();
+        }
+    }
+
+    // All colors used, pick based on hash of path
+    let hash = current_worktree.to_string_lossy().bytes().fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+    COLOR_PALETTE[hash % COLOR_PALETTE.len()].to_string()
 }
 
 fn run() -> Result<(), String> {
@@ -168,9 +250,10 @@ fn run() -> Result<(), String> {
         );
         println!();
 
-        // Set a slightly different background color to indicate PR review mode
-        // Subtle blue-ish tint on dark background
-        set_iterm_background("1a1a2e");
+        // Pick a unique background color for this worktree
+        let bg_color = pick_available_color(&worktree_dir, &final_path);
+        save_worktree_color(&final_path, &bg_color)?;
+        set_iterm_background(&bg_color);
 
         // Open Cursor in the worktree
         print!("{} Opening Cursor... ", "→".blue().bold());
