@@ -610,7 +610,7 @@ fn spawn_claude(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String> {
     let prompt = format!("/darren:checkout-pr {}", pr_number);
 
     let status = Command::new("claude")
-        .args(["--prompt", &prompt])
+        .arg(&prompt)
         .current_dir(worktree_path)
         .status()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
