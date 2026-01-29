@@ -68,6 +68,20 @@ fn set_iterm_background(hex_color: &str) {
     std::io::stdout().flush().ok();
 }
 
+/// Set iTerm2 tab title
+fn set_iterm_tab_title(title: &str) {
+    // OSC 1 sets the tab title
+    print!("\x1b]1;{}\x07", title);
+    std::io::stdout().flush().ok();
+}
+
+/// Reset iTerm2 tab title to default
+fn reset_iterm_tab_title() {
+    // Empty title resets to default behavior
+    print!("\x1b]1;\x07");
+    std::io::stdout().flush().ok();
+}
+
 /// Reset iTerm2 background to default
 fn reset_iterm_background() {
     // Reset to default by using empty value
@@ -250,10 +264,11 @@ fn run() -> Result<(), String> {
         );
         println!();
 
-        // Pick a unique background color for this worktree
+        // Set up iTerm session appearance
         let bg_color = pick_available_color(&worktree_dir, &final_path);
         save_worktree_color(&final_path, &bg_color)?;
         set_iterm_background(&bg_color);
+        set_iterm_tab_title(&format!("{} [WORKTREE]", pr_details.head_ref_name));
 
         // Open editors
         print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
@@ -264,8 +279,9 @@ fn run() -> Result<(), String> {
 
         let result = spawn_claude(&final_path, pr_number);
 
-        // Reset background when done
+        // Reset iTerm session appearance when done
         reset_iterm_background();
+        reset_iterm_tab_title();
 
         result?;
     }
