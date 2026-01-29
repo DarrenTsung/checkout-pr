@@ -44,6 +44,21 @@ fn main() {
     }
 }
 
+/// Set iTerm2 background color using proprietary escape sequence.
+/// Color format is hex RGB (e.g., "1a1a2e" for a slightly blue-tinted dark background)
+fn set_iterm_background(hex_color: &str) {
+    // iTerm2 escape sequence: OSC 1337 ; SetColors=bg=RRGGBB BEL
+    print!("\x1b]1337;SetColors=bg={}\x07", hex_color);
+    std::io::stdout().flush().ok();
+}
+
+/// Reset iTerm2 background to default
+fn reset_iterm_background() {
+    // Reset to default by using empty value
+    print!("\x1b]1337;SetColors=bg=default\x07");
+    std::io::stdout().flush().ok();
+}
+
 fn run() -> Result<(), String> {
     let args = Args::parse();
 
@@ -153,7 +168,16 @@ fn run() -> Result<(), String> {
         );
         println!();
 
-        spawn_claude(&final_path, pr_number)?;
+        // Set a slightly different background color to indicate PR review mode
+        // Subtle blue-ish tint on dark background
+        set_iterm_background("1a1a2e");
+
+        let result = spawn_claude(&final_path, pr_number);
+
+        // Reset background when done
+        reset_iterm_background();
+
+        result?;
     }
 
     Ok(())
