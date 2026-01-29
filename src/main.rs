@@ -255,10 +255,11 @@ fn run() -> Result<(), String> {
         save_worktree_color(&final_path, &bg_color)?;
         set_iterm_background(&bg_color);
 
-        // Open Cursor in the worktree
-        print!("{} Opening Cursor... ", "→".blue().bold());
+        // Open editors
+        print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
         std::io::stdout().flush().ok();
         open_cursor(&final_path)?;
+        open_sublime_merge(&final_path)?;
         println!("{}", "done".green());
 
         let result = spawn_claude(&final_path, pr_number);
@@ -602,6 +603,17 @@ fn open_cursor(worktree_path: &PathBuf) -> Result<(), String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to open Cursor: {}", e))?;
+
+    Ok(())
+}
+
+fn open_sublime_merge(worktree_path: &PathBuf) -> Result<(), String> {
+    Command::new("smerge")
+        .arg(worktree_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to open Sublime Merge: {}", e))?;
 
     Ok(())
 }
