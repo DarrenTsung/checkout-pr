@@ -172,6 +172,12 @@ fn run() -> Result<(), String> {
         // Subtle blue-ish tint on dark background
         set_iterm_background("1a1a2e");
 
+        // Open Cursor in the worktree
+        print!("{} Opening Cursor... ", "→".blue().bold());
+        std::io::stdout().flush().ok();
+        open_cursor(&final_path)?;
+        println!("{}", "done".green());
+
         let result = spawn_claude(&final_path, pr_number);
 
         // Reset background when done
@@ -502,6 +508,17 @@ fn run_mise_trust(worktree_path: &PathBuf) -> Result<(), String> {
     if !status.success() {
         return Err("mise trust failed".to_string());
     }
+
+    Ok(())
+}
+
+fn open_cursor(worktree_path: &PathBuf) -> Result<(), String> {
+    Command::new("cursor")
+        .arg(worktree_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to open Cursor: {}", e))?;
 
     Ok(())
 }
