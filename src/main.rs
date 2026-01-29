@@ -621,9 +621,14 @@ fn open_sublime_merge(worktree_path: &PathBuf) -> Result<(), String> {
 fn spawn_claude(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String> {
     let prompt = format!("/darren:checkout-pr {}", pr_number);
 
-    let status = Command::new("claude")
-        .arg(&prompt)
-        .current_dir(worktree_path)
+    // Use shell to cd first, ensuring claude starts in the right directory
+    let cmd = format!(
+        "cd '{}' && claude '{}'",
+        worktree_path.display(),
+        prompt
+    );
+    let status = Command::new("bash")
+        .args(["-c", &cmd])
         .status()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
 
