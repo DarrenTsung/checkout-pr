@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Color palette - subtle dark backgrounds with different hues
 const COLOR_PALETTE: &[&str] = &[
@@ -76,6 +77,8 @@ enum ExistingWorktreeAction {
 }
 
 fn main() {
+    setup_ctrlc_handler();
+
     if let Err(e) = run() {
         eprintln!("{} {}", "error:".red().bold(), e);
         std::process::exit(1);
@@ -107,6 +110,42 @@ fn set_iterm_badge(text: &str) {
 fn clear_iterm_badge() {
     print!("\x1b]1337;SetBadgeFormat=\x07");
     std::io::stdout().flush().ok();
+}
+
+// Track whether we've modified iTerm settings
+static ITERM_MODIFIED: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard that resets iTerm settings on drop
+struct ItermGuard;
+
+impl ItermGuard {
+    fn new(bg_color: &str, badge: &str) -> Self {
+        set_iterm_background(bg_color);
+        set_iterm_badge(badge);
+        ITERM_MODIFIED.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ItermGuard {
+    fn drop(&mut self) {
+        if ITERM_MODIFIED.load(Ordering::SeqCst) {
+            reset_iterm_background();
+            clear_iterm_badge();
+            ITERM_MODIFIED.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn setup_ctrlc_handler() {
+    ctrlc::set_handler(move || {
+        if ITERM_MODIFIED.load(Ordering::SeqCst) {
+            reset_iterm_background();
+            clear_iterm_badge();
+        }
+        std::process::exit(130); // Standard exit code for Ctrl+C
+    })
+    .ok();
 }
 
 fn base64_encode(input: &str) -> String {
@@ -311,8 +350,9 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
 
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
-        set_iterm_background(&bg_color);
-        set_iterm_badge(&format!("{} [WORKTREE]", pr_details.head_ref_name));
+
+        // Guard ensures iTerm settings are reset even on Ctrl+C or panic
+        let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", pr_details.head_ref_name));
 
         print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
         std::io::stdout().flush().ok();
@@ -320,12 +360,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
         open_sublime_merge(&final_path)?;
         println!("{}", "done".green());
 
-        let result = spawn_claude_pr(&final_path, pr_number);
-
-        reset_iterm_background();
-        clear_iterm_badge();
-
-        result?;
+        spawn_claude_pr(&final_path, pr_number)?;
     }
 
     Ok(())
@@ -418,8 +453,9 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
 
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
-        set_iterm_background(&bg_color);
-        set_iterm_badge(&format!("{} [WORKTREE]", branch_name));
+
+        // Guard ensures iTerm settings are reset even on Ctrl+C or panic
+        let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
 
         print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
         std::io::stdout().flush().ok();
@@ -427,12 +463,7 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
         open_sublime_merge(&final_path)?;
         println!("{}", "done".green());
 
-        let result = spawn_claude(&final_path);
-
-        reset_iterm_background();
-        clear_iterm_badge();
-
-        result?;
+        spawn_claude(&final_path)?;
     }
 
     Ok(())
