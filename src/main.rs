@@ -93,7 +93,8 @@ fn set_iterm_background(hex_color: &str) {
 
 /// Reset iTerm2 background to default
 fn reset_iterm_background() {
-    print!("\x1b]1337;SetColors=bg=default\x07");
+    // OSC 111 resets background color to default (standard xterm sequence)
+    print!("\x1b]111\x07");
     std::io::stdout().flush().ok();
 }
 
