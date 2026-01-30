@@ -106,39 +106,45 @@ fn reset_iterm_tab_title() {
     std::io::stdout().flush().ok();
 }
 
-const COLOR_FILE: &str = ".checkout-pr-color";
+fn get_color_dir() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(format!("{}/.local/share/checkout/colors", home))
+}
+
+fn worktree_color_file(worktree_path: &PathBuf) -> PathBuf {
+    // Use the worktree directory name as the color file name
+    let name = worktree_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    get_color_dir().join(name)
+}
 
 fn get_worktree_color(worktree_path: &PathBuf) -> Option<String> {
-    let color_file = worktree_path.join(COLOR_FILE);
+    let color_file = worktree_color_file(worktree_path);
     fs::read_to_string(color_file).ok().map(|s| s.trim().to_string())
 }
 
 fn save_worktree_color(worktree_path: &PathBuf, color: &str) -> Result<(), String> {
-    let color_file = worktree_path.join(COLOR_FILE);
-    fs::write(&color_file, color).map_err(|e| format!("Failed to save color: {}", e))?;
+    let color_dir = get_color_dir();
+    fs::create_dir_all(&color_dir).map_err(|e| format!("Failed to create color dir: {}", e))?;
 
-    let exclude_file = worktree_path.join(".git/info/exclude");
-    if exclude_file.exists() {
-        if let Ok(content) = fs::read_to_string(&exclude_file) {
-            if !content.contains(COLOR_FILE) {
-                let new_content = format!("{}\n{}", content.trim_end(), COLOR_FILE);
-                fs::write(&exclude_file, new_content).ok();
-            }
-        }
-    }
+    let color_file = worktree_color_file(worktree_path);
+    fs::write(&color_file, color).map_err(|e| format!("Failed to save color: {}", e))?;
 
     Ok(())
 }
 
-fn get_used_colors(worktree_dir: &PathBuf) -> HashSet<String> {
+fn get_used_colors() -> HashSet<String> {
     let mut used = HashSet::new();
+    let color_dir = get_color_dir();
 
-    if let Ok(entries) = fs::read_dir(worktree_dir) {
+    if let Ok(entries) = fs::read_dir(color_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(color) = get_worktree_color(&path) {
-                    used.insert(color);
+            if path.is_file() {
+                if let Ok(color) = fs::read_to_string(&path) {
+                    used.insert(color.trim().to_string());
                 }
             }
         }
@@ -147,12 +153,12 @@ fn get_used_colors(worktree_dir: &PathBuf) -> HashSet<String> {
     used
 }
 
-fn pick_available_color(worktree_dir: &PathBuf, current_worktree: &PathBuf) -> String {
+fn pick_available_color(current_worktree: &PathBuf) -> String {
     if let Some(existing) = get_worktree_color(current_worktree) {
         return existing;
     }
 
-    let used = get_used_colors(worktree_dir);
+    let used = get_used_colors();
 
     for color in COLOR_PALETTE {
         if !used.contains(*color) {
@@ -271,7 +277,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
         );
         println!();
 
-        let bg_color = pick_available_color(&worktree_dir, &final_path);
+        let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
         set_iterm_background(&bg_color);
         set_iterm_tab_title(&format!("{} [WORKTREE]", pr_details.head_ref_name));
@@ -378,7 +384,7 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
         );
         println!();
 
-        let bg_color = pick_available_color(&worktree_dir, &final_path);
+        let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
         set_iterm_background(&bg_color);
         set_iterm_tab_title(&format!("{} [WORKTREE]", branch_name));
