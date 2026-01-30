@@ -474,6 +474,12 @@ fn create_new_worktree_from_remote(
         println!("{}", "done".green());
     }
 
+    // Copy claude settings
+    print!("{} Copying claude settings... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    copy_claude_settings(worktree_path)?;
+    println!("{}", "done".green());
+
     Ok(())
 }
 
@@ -512,6 +518,12 @@ fn create_new_worktree_new_branch(
     print!("{} Tracking with Graphite... ", "→".blue().bold());
     std::io::stdout().flush().ok();
     run_gt_track(worktree_path)?;
+    println!("{}", "done".green());
+
+    // Copy claude settings
+    print!("{} Copying claude settings... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    copy_claude_settings(worktree_path)?;
     println!("{}", "done".green());
 
     Ok(())
@@ -821,6 +833,26 @@ fn run_gt_track(worktree_path: &PathBuf) -> Result<(), String> {
     if !status.success() {
         return Err("gt track failed".to_string());
     }
+
+    Ok(())
+}
+
+fn copy_claude_settings(worktree_path: &PathBuf) -> Result<(), String> {
+    let home = env::var("HOME").map_err(|_| "HOME not set")?;
+    let source = PathBuf::from(format!("{}/.claude/settings.local.json", home));
+
+    if !source.exists() {
+        // No settings file to copy, that's fine
+        return Ok(());
+    }
+
+    let dest_dir = worktree_path.join(".claude");
+    fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("Failed to create .claude dir: {}", e))?;
+
+    let dest = dest_dir.join("settings.local.json");
+    fs::copy(&source, &dest)
+        .map_err(|e| format!("Failed to copy claude settings: {}", e))?;
 
     Ok(())
 }
