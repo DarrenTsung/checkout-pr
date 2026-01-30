@@ -94,16 +94,48 @@ fn reset_iterm_background() {
     std::io::stdout().flush().ok();
 }
 
-/// Set iTerm2 tab title
-fn set_iterm_tab_title(title: &str) {
-    print!("\x1b]1;{}\x07", title);
+/// Set iTerm2 tab badge (persists even when apps change the title)
+fn set_iterm_badge(text: &str) {
+    use std::io::Write;
+    // iTerm2 proprietary: SetBadgeFormat takes base64-encoded text
+    let encoded = base64_encode(text);
+    print!("\x1b]1337;SetBadgeFormat={}\x07", encoded);
     std::io::stdout().flush().ok();
 }
 
-/// Reset iTerm2 tab title to default
-fn reset_iterm_tab_title() {
-    print!("\x1b]1;\x07");
+/// Clear iTerm2 tab badge
+fn clear_iterm_badge() {
+    print!("\x1b]1337;SetBadgeFormat=\x07");
     std::io::stdout().flush().ok();
+}
+
+fn base64_encode(input: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut result = String::new();
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+
+        result.push(ALPHABET[b0 >> 2] as char);
+        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+
+        if chunk.len() > 2 {
+            result.push(ALPHABET[b2 & 0x3f] as char);
+        } else {
+            result.push('=');
+        }
+    }
+
+    result
 }
 
 fn get_color_dir() -> PathBuf {
@@ -280,7 +312,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
         set_iterm_background(&bg_color);
-        set_iterm_tab_title(&format!("{} [WORKTREE]", pr_details.head_ref_name));
+        set_iterm_badge(&format!("{} [WORKTREE]", pr_details.head_ref_name));
 
         print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
         std::io::stdout().flush().ok();
@@ -291,7 +323,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
         let result = spawn_claude_pr(&final_path, pr_number);
 
         reset_iterm_background();
-        reset_iterm_tab_title();
+        clear_iterm_badge();
 
         result?;
     }
@@ -387,7 +419,7 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
         set_iterm_background(&bg_color);
-        set_iterm_tab_title(&format!("{} [WORKTREE]", branch_name));
+        set_iterm_badge(&format!("{} [WORKTREE]", branch_name));
 
         print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
         std::io::stdout().flush().ok();
@@ -398,7 +430,7 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
         let result = spawn_claude(&final_path);
 
         reset_iterm_background();
-        reset_iterm_tab_title();
+        clear_iterm_badge();
 
         result?;
     }
