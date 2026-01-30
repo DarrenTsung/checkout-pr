@@ -98,18 +98,15 @@ fn reset_iterm_background() {
     std::io::stdout().flush().ok();
 }
 
-/// Set iTerm2 tab badge (persists even when apps change the title)
-fn set_iterm_badge(text: &str) {
-    use std::io::Write;
-    // iTerm2 proprietary: SetBadgeFormat takes base64-encoded text
-    let encoded = base64_encode(text);
-    print!("\x1b]1337;SetBadgeFormat={}\x07", encoded);
+/// Set iTerm2 session title
+fn set_iterm_title(title: &str) {
+    print!("\x1b]0;{}\x07", title);
     std::io::stdout().flush().ok();
 }
 
-/// Clear iTerm2 tab badge
-fn clear_iterm_badge() {
-    print!("\x1b]1337;SetBadgeFormat=\x07");
+/// Reset iTerm2 session title
+fn reset_iterm_title() {
+    print!("\x1b]0;\x07");
     std::io::stdout().flush().ok();
 }
 
@@ -120,9 +117,9 @@ static ITERM_MODIFIED: AtomicBool = AtomicBool::new(false);
 struct ItermGuard;
 
 impl ItermGuard {
-    fn new(bg_color: &str, badge: &str) -> Self {
+    fn new(bg_color: &str, title: &str) -> Self {
         set_iterm_background(bg_color);
-        set_iterm_badge(badge);
+        set_iterm_title(title);
         ITERM_MODIFIED.store(true, Ordering::SeqCst);
         Self
     }
@@ -132,7 +129,7 @@ impl Drop for ItermGuard {
     fn drop(&mut self) {
         if ITERM_MODIFIED.load(Ordering::SeqCst) {
             reset_iterm_background();
-            clear_iterm_badge();
+            reset_iterm_title();
             ITERM_MODIFIED.store(false, Ordering::SeqCst);
         }
     }
@@ -142,40 +139,11 @@ fn setup_ctrlc_handler() {
     ctrlc::set_handler(move || {
         if ITERM_MODIFIED.load(Ordering::SeqCst) {
             reset_iterm_background();
-            clear_iterm_badge();
+            reset_iterm_title();
         }
         std::process::exit(130); // Standard exit code for Ctrl+C
     })
     .ok();
-}
-
-fn base64_encode(input: &str) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = input.as_bytes();
-    let mut result = String::new();
-
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-
-        result.push(ALPHABET[b0 >> 2] as char);
-        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-
-        if chunk.len() > 1 {
-            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
-        } else {
-            result.push('=');
-        }
-
-        if chunk.len() > 2 {
-            result.push(ALPHABET[b2 & 0x3f] as char);
-        } else {
-            result.push('=');
-        }
-    }
-
-    result
 }
 
 fn get_color_dir() -> PathBuf {
