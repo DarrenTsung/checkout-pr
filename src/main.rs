@@ -100,13 +100,15 @@ fn reset_iterm_background() {
 
 /// Set iTerm2 session title
 fn set_iterm_title(title: &str) {
-    print!("\x1b]0;{}\x07", title);
+    // OSC 1 sets tab/icon title, OSC 2 sets window title
+    // Set both to ensure the title shows
+    print!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title);
     std::io::stdout().flush().ok();
 }
 
 /// Reset iTerm2 session title
 fn reset_iterm_title() {
-    print!("\x1b]0;\x07");
+    print!("\x1b]1;\x07\x1b]2;\x07");
     std::io::stdout().flush().ok();
 }
 
