@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -480,6 +481,12 @@ fn create_new_worktree_from_remote(
     copy_claude_settings(worktree_path)?;
     println!("{}", "done".green());
 
+    // Add claude trust
+    print!("{} Adding claude trust... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    add_claude_trust(worktree_path)?;
+    println!("{}", "done".green());
+
     Ok(())
 }
 
@@ -524,6 +531,12 @@ fn create_new_worktree_new_branch(
     print!("{} Copying claude settings... ", "→".blue().bold());
     std::io::stdout().flush().ok();
     copy_claude_settings(worktree_path)?;
+    println!("{}", "done".green());
+
+    // Add claude trust
+    print!("{} Adding claude trust... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    add_claude_trust(worktree_path)?;
     println!("{}", "done".green());
 
     Ok(())
@@ -853,6 +866,56 @@ fn copy_claude_settings(worktree_path: &PathBuf) -> Result<(), String> {
     let dest = dest_dir.join("settings.local.json");
     fs::copy(&source, &dest)
         .map_err(|e| format!("Failed to copy claude settings: {}", e))?;
+
+    Ok(())
+}
+
+fn add_claude_trust(worktree_path: &PathBuf) -> Result<(), String> {
+    let home = env::var("HOME").map_err(|_| "HOME not set")?;
+    let claude_json_path = PathBuf::from(format!("{}/.claude.json", home));
+
+    // Read existing file or create empty object
+    let mut data: Value = if claude_json_path.exists() {
+        let content = fs::read_to_string(&claude_json_path)
+            .map_err(|e| format!("Failed to read .claude.json: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse .claude.json: {}", e))?
+    } else {
+        serde_json::json!({})
+    };
+
+    // Ensure projects object exists
+    if data.get("projects").is_none() {
+        data["projects"] = serde_json::json!({});
+    }
+
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+
+    // Add or update the project entry with trust accepted
+    data["projects"][&worktree_path_str] = serde_json::json!({
+        "allowedTools": [],
+        "mcpContextUris": [],
+        "mcpServers": {},
+        "enabledMcpjsonServers": [],
+        "disabledMcpjsonServers": [],
+        "hasTrustDialogAccepted": true,
+        "projectOnboardingSeenCount": 0,
+        "hasClaudeMdExternalIncludesApproved": false,
+        "hasClaudeMdExternalIncludesWarningShown": false,
+        "reactVulnerabilityCache": {
+            "detected": false,
+            "package": null,
+            "packageName": null,
+            "version": null,
+            "packageManager": null
+        }
+    });
+
+    // Write back to file
+    let content = serde_json::to_string_pretty(&data)
+        .map_err(|e| format!("Failed to serialize .claude.json: {}", e))?;
+    fs::write(&claude_json_path, content)
+        .map_err(|e| format!("Failed to write .claude.json: {}", e))?;
 
     Ok(())
 }
