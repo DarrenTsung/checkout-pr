@@ -62,6 +62,12 @@ enum Commands {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Open Cursor and Sublime Merge for the current directory
+    Open {
+        /// Path to open (default: current working directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Deserialize)]
@@ -219,6 +225,7 @@ fn run() -> Result<(), String> {
     match cli.command {
         Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo),
         Commands::Branch { name, no_claude, repo } => run_branch(&name, no_claude, repo),
+        Commands::Open { path } => run_open(&path),
     }
 }
 
@@ -437,6 +444,31 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
 
         spawn_claude(&final_path)?;
     }
+
+    Ok(())
+}
+
+fn run_open(path: &PathBuf) -> Result<(), String> {
+    let abs_path = if path.is_absolute() {
+        path.clone()
+    } else {
+        env::current_dir()
+            .map_err(|e| format!("Failed to get current directory: {}", e))?
+            .join(path)
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve path: {}", e))?
+    };
+
+    println!(
+        "{} Opening {} in Cursor & Sublime Merge...",
+        "→".blue().bold(),
+        abs_path.display().to_string().cyan()
+    );
+
+    open_cursor(&abs_path)?;
+    open_sublime_merge(&abs_path)?;
+
+    println!("{} Done", "✓".green().bold());
 
     Ok(())
 }
