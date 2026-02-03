@@ -62,12 +62,6 @@ enum Commands {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Open Cursor and Sublime Merge for the current directory
-    Open {
-        /// Path to open (default: current working directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
 }
 
 #[derive(Deserialize)]
@@ -225,7 +219,6 @@ fn run() -> Result<(), String> {
     match cli.command {
         Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo),
         Commands::Branch { name, no_claude, repo } => run_branch(&name, no_claude, repo),
-        Commands::Open { path } => run_open(&path),
     }
 }
 
@@ -333,12 +326,6 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
         let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", pr_details.head_ref_name));
 
-        print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
-        std::io::stdout().flush().ok();
-        open_cursor(&final_path)?;
-        open_sublime_merge(&final_path)?;
-        println!("{}", "done".green());
-
         spawn_claude_pr(&final_path, pr_number)?;
     }
 
@@ -436,39 +423,8 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
         let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
 
-        print!("{} Opening Cursor & Sublime Merge... ", "→".blue().bold());
-        std::io::stdout().flush().ok();
-        open_cursor(&final_path)?;
-        open_sublime_merge(&final_path)?;
-        println!("{}", "done".green());
-
         spawn_claude(&final_path)?;
     }
-
-    Ok(())
-}
-
-fn run_open(path: &PathBuf) -> Result<(), String> {
-    let abs_path = if path.is_absolute() {
-        path.clone()
-    } else {
-        env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {}", e))?
-            .join(path)
-            .canonicalize()
-            .map_err(|e| format!("Failed to resolve path: {}", e))?
-    };
-
-    println!(
-        "{} Opening {} in Cursor & Sublime Merge...",
-        "→".blue().bold(),
-        abs_path.display().to_string().cyan()
-    );
-
-    open_cursor(&abs_path)?;
-    open_sublime_merge(&abs_path)?;
-
-    println!("{} Done", "✓".green().bold());
 
     Ok(())
 }
@@ -978,28 +934,6 @@ fn add_claude_trust(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), 
         .map_err(|e| format!("Failed to serialize .claude.json: {}", e))?;
     fs::write(&claude_json_path, content)
         .map_err(|e| format!("Failed to write .claude.json: {}", e))?;
-
-    Ok(())
-}
-
-fn open_cursor(worktree_path: &PathBuf) -> Result<(), String> {
-    Command::new("cursor")
-        .arg(worktree_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to open Cursor: {}", e))?;
-
-    Ok(())
-}
-
-fn open_sublime_merge(worktree_path: &PathBuf) -> Result<(), String> {
-    Command::new("smerge")
-        .arg(worktree_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to open Sublime Merge: {}", e))?;
 
     Ok(())
 }
