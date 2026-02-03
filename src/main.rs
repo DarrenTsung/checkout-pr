@@ -516,7 +516,7 @@ fn create_new_worktree_from_remote(
     // Add claude trust
     print!("{} Adding claude trust... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    add_claude_trust(worktree_path)?;
+    add_claude_trust(worktree_path, repo_root)?;
     println!("{}", "done".green());
 
     Ok(())
@@ -568,7 +568,7 @@ fn create_new_worktree_new_branch(
     // Add claude trust
     print!("{} Adding claude trust... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    add_claude_trust(worktree_path)?;
+    add_claude_trust(worktree_path, repo_root)?;
     println!("{}", "done".green());
 
     Ok(())
@@ -902,7 +902,7 @@ fn copy_claude_settings(worktree_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn add_claude_trust(worktree_path: &PathBuf) -> Result<(), String> {
+fn add_claude_trust(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
     let home = env::var("HOME").map_err(|_| "HOME not set")?;
     let claude_json_path = PathBuf::from(format!("{}/.claude.json", home));
 
@@ -922,26 +922,56 @@ fn add_claude_trust(worktree_path: &PathBuf) -> Result<(), String> {
     }
 
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    let repo_root_str = repo_root.to_string_lossy().to_string();
 
-    // Add or update the project entry with trust accepted
-    data["projects"][&worktree_path_str] = serde_json::json!({
-        "allowedTools": [],
-        "mcpContextUris": [],
-        "mcpServers": {},
-        "enabledMcpjsonServers": [],
-        "disabledMcpjsonServers": [],
-        "hasTrustDialogAccepted": true,
-        "projectOnboardingSeenCount": 0,
-        "hasClaudeMdExternalIncludesApproved": false,
-        "hasClaudeMdExternalIncludesWarningShown": false,
-        "reactVulnerabilityCache": {
-            "detected": false,
-            "package": null,
-            "packageName": null,
-            "version": null,
-            "packageManager": null
-        }
+    // Try to copy settings from the main repo, or use defaults
+    let base_settings = data
+        .get("projects")
+        .and_then(|p| p.get(&repo_root_str))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({
+            "allowedTools": [],
+            "mcpContextUris": [],
+            "mcpServers": {},
+            "enabledMcpjsonServers": [],
+            "disabledMcpjsonServers": [],
+            "projectOnboardingSeenCount": 0,
+            "hasClaudeMdExternalIncludesApproved": false,
+            "hasClaudeMdExternalIncludesWarningShown": false,
+            "reactVulnerabilityCache": {
+                "detected": false,
+                "package": null,
+                "packageName": null,
+                "version": null,
+                "packageManager": null
+            }
+        }));
+
+    // Create new project entry based on main repo settings
+    let mut new_project = base_settings.clone();
+    // Always ensure trust is accepted for new worktrees
+    new_project["hasTrustDialogAccepted"] = serde_json::json!(true);
+    // Reset session-specific fields
+    new_project.as_object_mut().map(|obj| {
+        obj.remove("lastAPIDuration");
+        obj.remove("lastAPIDurationWithoutRetries");
+        obj.remove("lastCost");
+        obj.remove("lastDuration");
+        obj.remove("lastLinesAdded");
+        obj.remove("lastLinesRemoved");
+        obj.remove("lastModelUsage");
+        obj.remove("lastSessionId");
+        obj.remove("lastToolDuration");
+        obj.remove("lastTotalCacheCreationInputTokens");
+        obj.remove("lastTotalCacheReadInputTokens");
+        obj.remove("lastTotalInputTokens");
+        obj.remove("lastTotalOutputTokens");
+        obj.remove("lastTotalWebSearchRequests");
+        obj.remove("exampleFiles");
+        obj.remove("exampleFilesGeneratedAt");
     });
+
+    data["projects"][&worktree_path_str] = new_project;
 
     // Write back to file
     let content = serde_json::to_string_pretty(&data)
