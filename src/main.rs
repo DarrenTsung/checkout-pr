@@ -11,18 +11,20 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Color palette - subtle dark backgrounds with different hues
+/// Color palette - subtle dark backgrounds with pastel hues
 const COLOR_PALETTE: &[&str] = &[
-    "1a1a2e", // blue-ish
-    "1a2e1a", // green-ish
-    "2e1a1a", // red-ish
-    "2e2e1a", // yellow-ish
-    "2e1a2e", // purple-ish
-    "1a2e2e", // cyan-ish
-    "251a2e", // magenta-ish
-    "1a252e", // teal-ish
-    "2e251a", // orange-ish
-    "1e1a2e", // indigo-ish
+    "1e2233", // soft navy
+    "1e2828", // soft sage
+    "2d1f2d", // dusty plum
+    "1f2d2d", // seafoam
+    "2b2433", // lavender
+    "33261f", // warm taupe
+    "1f2b33", // powder blue
+    "2d2626", // dusty rose
+    "262d26", // soft mint
+    "332b1f", // soft peach
+    "261f2d", // soft violet
+    "1f332b", // soft teal
 ];
 
 #[derive(Parser)]
