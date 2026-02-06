@@ -129,6 +129,16 @@ fn reset_iterm_title() {
     std::io::stdout().flush().ok();
 }
 
+/// Set terminal working directory via OSC 7 escape sequence
+/// This tells the terminal what directory cmd-click paths should resolve from
+fn set_terminal_cwd(path: &PathBuf) {
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "localhost".to_string());
+    print!("\x1b]7;file://{}{}\x07", hostname, path.display());
+    std::io::stdout().flush().ok();
+}
+
 // Track whether we've modified iTerm settings
 static ITERM_MODIFIED: AtomicBool = AtomicBool::new(false);
 
@@ -1190,6 +1200,8 @@ fn add_claude_trust(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), 
 fn spawn_claude_pr(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String> {
     let prompt = format!("/darren:checkout-pr {}", pr_number);
 
+    set_terminal_cwd(worktree_path);
+
     let status = Command::new("claude")
         .arg(&prompt)
         .current_dir(worktree_path)
@@ -1204,6 +1216,8 @@ fn spawn_claude_pr(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String
 }
 
 fn spawn_claude(worktree_path: &PathBuf) -> Result<(), String> {
+    set_terminal_cwd(worktree_path);
+
     let status = Command::new("claude")
         .current_dir(worktree_path)
         .status()
