@@ -62,6 +62,22 @@ enum Commands {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// List all worktrees and their status
+    Status {
+        /// Path to the main figma repo (default: ~/figma/figma)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Remove worktrees that have no uncommitted changes
+    Clean {
+        /// Path to the main figma repo (default: ~/figma/figma)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -219,6 +235,8 @@ fn run() -> Result<(), String> {
     match cli.command {
         Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo),
         Commands::Branch { name, no_claude, repo } => run_branch(&name, no_claude, repo),
+        Commands::Status { repo } => run_status(repo),
+        Commands::Clean { repo, yes } => run_clean(repo, yes),
     }
 }
 
@@ -239,7 +257,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
 
     print!("{} Fetching PR details... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    let pr_details = fetch_pr_details(pr_number)?;
+    let pr_details = fetch_pr_details(pr_number, &repo_root)?;
     println!("{}", "done".green());
 
     println!(
@@ -429,6 +447,220 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
     Ok(())
 }
 
+struct WorktreeInfo {
+    path: PathBuf,
+    branch: String,
+    has_changes: bool,
+}
+
+fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
+    let output = Command::new("git")
+        .args(["-C", &repo_root.to_string_lossy(), "worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|e| format!("Failed to list worktrees: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut worktrees = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+
+    for line in stdout.lines() {
+        if let Some(path_str) = line.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(path_str));
+        } else if let Some(branch_str) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(branch_str.to_string());
+        } else if line.is_empty() {
+            if let Some(path) = current_path.take() {
+                // Skip the main repo itself
+                if path != *repo_root {
+                    let branch = current_branch.take().unwrap_or_else(|| "(detached)".to_string());
+                    let has_changes = has_uncommitted_changes(&path).unwrap_or(false);
+                    worktrees.push(WorktreeInfo {
+                        path,
+                        branch,
+                        has_changes,
+                    });
+                }
+            }
+            current_branch = None;
+        }
+    }
+
+    // Sort by path for consistent output
+    worktrees.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Ok(worktrees)
+}
+
+fn run_status(repo: Option<PathBuf>) -> Result<(), String> {
+    let home = env::var("HOME").map_err(|_| "HOME not set")?;
+    let repo_root = repo.unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
+
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+
+    let worktrees = get_all_worktrees(&repo_root)?;
+
+    if worktrees.is_empty() {
+        println!("{} No worktrees found", "→".blue().bold());
+        return Ok(());
+    }
+
+    println!(
+        "{} {} worktree(s) found:\n",
+        "→".blue().bold(),
+        worktrees.len()
+    );
+
+    for wt in &worktrees {
+        let status = if wt.has_changes {
+            "modified".yellow().bold()
+        } else {
+            "clean".green()
+        };
+
+        let dir_name = wt.path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| wt.path.display().to_string());
+
+        println!(
+            "  {} {} {}",
+            format!("[{}]", status).to_string(),
+            dir_name.cyan(),
+            format!("({})", wt.branch).dimmed()
+        );
+    }
+
+    let clean_count = worktrees.iter().filter(|w| !w.has_changes).count();
+    let modified_count = worktrees.iter().filter(|w| w.has_changes).count();
+
+    println!();
+    if clean_count > 0 {
+        println!(
+            "{} {} clean worktree(s) can be removed with: {} {}",
+            "tip:".yellow().bold(),
+            clean_count,
+            "checkout clean".cyan(),
+            if modified_count > 0 { format!("({} with changes will be kept)", modified_count) } else { String::new() }.dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
+    let home = env::var("HOME").map_err(|_| "HOME not set")?;
+    let repo_root = repo.unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
+
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+
+    let worktrees = get_all_worktrees(&repo_root)?;
+    let clean_worktrees: Vec<_> = worktrees.into_iter().filter(|w| !w.has_changes).collect();
+
+    if clean_worktrees.is_empty() {
+        println!("{} No clean worktrees to remove", "→".blue().bold());
+        return Ok(());
+    }
+
+    println!(
+        "{} Found {} clean worktree(s) to remove:\n",
+        "→".blue().bold(),
+        clean_worktrees.len()
+    );
+
+    for wt in &clean_worktrees {
+        let dir_name = wt.path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| wt.path.display().to_string());
+        println!("  {} {}", "•".dimmed(), dir_name.cyan());
+    }
+
+    if !skip_confirm {
+        println!();
+        print!(
+            "{} Remove these worktrees? [y/N]: ",
+            "?".magenta().bold()
+        );
+        io::stdout().flush().map_err(|e| e.to_string())?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("Failed to read input: {}", e))?;
+
+        if input.trim().to_lowercase() != "y" {
+            println!("{} Cancelled", "→".blue().bold());
+            return Ok(());
+        }
+    }
+
+    println!();
+
+    let mut removed_count = 0;
+    let mut failed: Vec<String> = Vec::new();
+
+    for wt in &clean_worktrees {
+        let dir_name = wt.path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| wt.path.display().to_string());
+
+        print!("{} Removing {}... ", "→".blue().bold(), dir_name.cyan());
+        std::io::stdout().flush().ok();
+
+        // Remove worktree using git
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &repo_root.to_string_lossy(),
+                "worktree",
+                "remove",
+                &wt.path.to_string_lossy(),
+            ])
+            .output()
+            .map_err(|e| format!("Failed to remove worktree: {}", e))?;
+
+        if output.status.success() {
+            // Also remove the color file
+            let color_file = worktree_color_file(&wt.path);
+            let _ = fs::remove_file(color_file);
+
+            println!("{}", "done".green());
+            removed_count += 1;
+        } else {
+            println!("{}", "failed".red());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let error_msg = stderr.trim();
+            if !error_msg.is_empty() {
+                println!("    {} {}", "error:".red(), error_msg);
+            }
+            failed.push(dir_name);
+        }
+    }
+
+    println!();
+    if removed_count > 0 {
+        println!(
+            "{} Removed {} worktree(s)",
+            "✓".green().bold(),
+            removed_count
+        );
+    }
+
+    if !failed.is_empty() {
+        println!(
+            "{} Failed to remove {} worktree(s): {}",
+            "✗".red().bold(),
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 fn create_new_worktree_from_remote(
     repo_root: &PathBuf,
     worktree_dir: &PathBuf,
@@ -466,7 +698,7 @@ fn create_new_worktree_from_remote(
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    copy_claude_settings(worktree_path)?;
+    copy_claude_settings(worktree_path, repo_root)?;
     println!("{}", "done".green());
 
     // Add claude trust
@@ -518,7 +750,7 @@ fn create_new_worktree_new_branch(
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    copy_claude_settings(worktree_path)?;
+    copy_claude_settings(worktree_path, repo_root)?;
     println!("{}", "done".green());
 
     // Add claude trust
@@ -627,9 +859,10 @@ fn extract_pr_number(input: &str) -> Result<u64, String> {
     ))
 }
 
-fn fetch_pr_details(pr_number: u64) -> Result<PrDetails, String> {
+fn fetch_pr_details(pr_number: u64, repo_root: &PathBuf) -> Result<PrDetails, String> {
     let output = Command::new("gh")
         .args(["pr", "view", &pr_number.to_string(), "--json", "headRefName,title"])
+        .current_dir(repo_root)
         .output()
         .map_err(|e| format!("Failed to run gh: {}", e))?;
 
@@ -838,12 +1071,28 @@ fn run_gt_track(worktree_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_claude_settings(worktree_path: &PathBuf) -> Result<(), String> {
-    let home = env::var("HOME").map_err(|_| "HOME not set")?;
-    let source = PathBuf::from(format!("{}/.claude/settings.local.json", home));
+fn copy_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
+    // Copy the main repo's .claude/settings.local.json to the worktree
+    // This contains MCP server configurations and other local settings
+    let source = repo_root.join(".claude/settings.local.json");
 
     if !source.exists() {
-        // No settings file to copy, that's fine
+        // Fall back to global settings if repo-specific doesn't exist
+        let home = env::var("HOME").map_err(|_| "HOME not set")?;
+        let global_source = PathBuf::from(format!("{}/.claude/settings.local.json", home));
+
+        if !global_source.exists() {
+            return Ok(());
+        }
+
+        let dest_dir = worktree_path.join(".claude");
+        fs::create_dir_all(&dest_dir)
+            .map_err(|e| format!("Failed to create .claude dir: {}", e))?;
+
+        let dest = dest_dir.join("settings.local.json");
+        fs::copy(&global_source, &dest)
+            .map_err(|e| format!("Failed to copy claude settings: {}", e))?;
+
         return Ok(());
     }
 
