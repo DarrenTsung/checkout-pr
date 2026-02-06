@@ -1190,13 +1190,9 @@ fn add_claude_trust(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), 
 fn spawn_claude_pr(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String> {
     let prompt = format!("/darren:checkout-pr {}", pr_number);
 
-    let cmd = format!(
-        "cd '{}' && claude '{}'",
-        worktree_path.display(),
-        prompt
-    );
-    let status = Command::new("bash")
-        .args(["-c", &cmd])
+    let status = Command::new("claude")
+        .arg(&prompt)
+        .current_dir(worktree_path)
         .status()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
 
@@ -1208,9 +1204,8 @@ fn spawn_claude_pr(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String
 }
 
 fn spawn_claude(worktree_path: &PathBuf) -> Result<(), String> {
-    let cmd = format!("cd '{}' && claude", worktree_path.display());
-    let status = Command::new("bash")
-        .args(["-c", &cmd])
+    let status = Command::new("claude")
+        .current_dir(worktree_path)
         .status()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
 
