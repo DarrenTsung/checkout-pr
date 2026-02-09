@@ -51,6 +51,19 @@ enum Commands {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Check out a GitHub PR into a worktree and review it
+    Review {
+        /// PR number or GitHub PR URL (e.g., 123 or https://github.com/figma/figma/pull/123)
+        pr: String,
+
+        /// Skip spawning claude after creating the worktree
+        #[arg(long)]
+        no_claude: bool,
+
+        /// Path to the main figma repo (default: ~/figma/figma)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Create a new branch in a worktree
     Branch {
         /// Branch name (will be prefixed with darren/ if not already)
@@ -245,14 +258,15 @@ fn run() -> Result<(), String> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo),
+        Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/darren:checkout-pr"),
+        Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/darren:checkout-and-review-pr"),
         Commands::Branch { name, no_claude, repo } => run_branch(&name, no_claude, repo),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
     }
 }
 
-fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String> {
+fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str) -> Result<(), String> {
     let pr_number = extract_pr_number(pr)?;
     println!(
         "{} PR #{}",
@@ -342,11 +356,12 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
             "&& claude".dimmed()
         );
     } else {
+        let full_prompt = format!("{} {}", claude_prompt, pr_number);
         println!();
         println!(
             "{} Spawning claude with {}...",
             "→".blue().bold(),
-            format!("/darren:checkout-pr {}", pr_number).cyan()
+            full_prompt.cyan()
         );
         println!();
 
@@ -356,7 +371,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
         let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", pr_details.head_ref_name));
 
-        spawn_claude_pr(&final_path, pr_number)?;
+        spawn_claude_with_prompt(&final_path, &full_prompt)?;
     }
 
     Ok(())
@@ -1199,13 +1214,11 @@ fn add_claude_trust(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), 
     Ok(())
 }
 
-fn spawn_claude_pr(worktree_path: &PathBuf, pr_number: u64) -> Result<(), String> {
-    let prompt = format!("/darren:checkout-pr {}", pr_number);
-
+fn spawn_claude_with_prompt(worktree_path: &PathBuf, prompt: &str) -> Result<(), String> {
     set_terminal_cwd(worktree_path);
 
     let status = Command::new("claude")
-        .arg(&prompt)
+        .arg(prompt)
         .current_dir(worktree_path)
         .status()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
