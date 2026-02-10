@@ -487,7 +487,9 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
         .map_err(|e| format!("Failed to list worktrees: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut worktrees = Vec::new();
+
+    // First pass: collect paths and branches
+    let mut entries: Vec<(PathBuf, String)> = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_branch: Option<String> = None;
 
@@ -498,20 +500,39 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
             current_branch = Some(branch_str.to_string());
         } else if line.is_empty() {
             if let Some(path) = current_path.take() {
-                // Skip the main repo itself
                 if path != *repo_root {
                     let branch = current_branch.take().unwrap_or_else(|| "(detached)".to_string());
-                    let has_changes = has_uncommitted_changes(&path).unwrap_or(false);
-                    worktrees.push(WorktreeInfo {
-                        path,
-                        branch,
-                        has_changes,
-                    });
+                    entries.push((path, branch));
                 }
             }
             current_branch = None;
         }
     }
+
+    // Spawn all git-status checks in parallel
+    let children: Vec<_> = entries
+        .iter()
+        .map(|(path, _)| {
+            Command::new("git")
+                .args(["-C", &path.to_string_lossy(), "status", "--porcelain"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+        })
+        .collect();
+
+    // Collect results
+    let mut worktrees: Vec<WorktreeInfo> = entries
+        .into_iter()
+        .zip(children)
+        .map(|((path, branch), child)| {
+            let has_changes = child
+                .and_then(|c| c.wait_with_output())
+                .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+                .unwrap_or(false);
+            WorktreeInfo { path, branch, has_changes }
+        })
+        .collect();
 
     // Sort by path for consistent output
     worktrees.sort_by(|a, b| a.path.cmp(&b.path));
