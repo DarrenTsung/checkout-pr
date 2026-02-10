@@ -606,24 +606,45 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
     }
 
     let worktrees = get_all_worktrees(&repo_root)?;
-    let clean_worktrees: Vec<_> = worktrees.into_iter().filter(|w| !w.has_changes).collect();
 
-    if clean_worktrees.is_empty() {
-        println!("{} No clean worktrees to remove", "→".blue().bold());
+    if worktrees.is_empty() {
+        println!("{} No worktrees found", "→".blue().bold());
         return Ok(());
     }
 
     println!(
-        "{} Found {} clean worktree(s) to remove:\n",
+        "{} {} worktree(s) found:\n",
         "→".blue().bold(),
-        clean_worktrees.len()
+        worktrees.len()
     );
 
-    for wt in &clean_worktrees {
+    for wt in &worktrees {
         let dir_name = wt.path.file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| wt.path.display().to_string());
-        println!("  {} {}", "•".dimmed(), dir_name.cyan());
+
+        if wt.has_changes {
+            println!(
+                "  {} {} {}",
+                format!("[{}]", "modified".yellow().bold()),
+                dir_name.cyan(),
+                format!("({})", wt.branch).dimmed()
+            );
+        } else {
+            println!(
+                "  {} {} {}",
+                format!("[{}]", "remove".red()),
+                dir_name.cyan(),
+                format!("({})", wt.branch).dimmed()
+            );
+        }
+    }
+
+    let clean_worktrees: Vec<_> = worktrees.into_iter().filter(|w| !w.has_changes).collect();
+
+    if clean_worktrees.is_empty() {
+        println!("\n{} All worktrees have uncommitted changes, nothing to remove", "→".blue().bold());
+        return Ok(());
     }
 
     if !skip_confirm {
