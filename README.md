@@ -30,13 +30,20 @@ Or, if you're making frequent changes and don't want to reinstall each time:
 
 This adds a shell function that builds from source on each invocation.
 
+## Configuration
+
+| Environment Variable | Description | Default |
+|---|---|---|
+| `CHECKOUT_REPO` | Path to the main git repo | (required) |
+| `CHECKOUT_WORKTREE_DIR` | Directory for worktrees | (required) |
+
 ## Options
 
 | Flag | Description |
 |---|---|
 | `--no-claude` | Skip launching Claude after creating the worktree |
 | `--claude-prompt <file>` | Use file contents as the initial Claude prompt (branch only) |
-| `--repo <path>` | Override the repo path (default: `~/figma/figma`) |
+| `--repo <path>` | Override the repo path |
 | `-y` | Skip confirmation in `clean` |
 
 ## Requirements

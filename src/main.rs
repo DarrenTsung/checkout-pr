@@ -40,27 +40,27 @@ struct Cli {
 enum Commands {
     /// Check out a GitHub PR into a worktree
     Pr {
-        /// PR number or GitHub PR URL (e.g., 123 or https://github.com/figma/figma/pull/123)
+        /// PR number or GitHub PR URL (e.g., 123 or https://github.com/org/repo/pull/123)
         pr: String,
 
         /// Skip spawning claude after creating the worktree
         #[arg(long)]
         no_claude: bool,
 
-        /// Path to the main figma repo (default: ~/figma/figma)
+        /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
     },
     /// Check out a GitHub PR into a worktree and review it
     Review {
-        /// PR number or GitHub PR URL (e.g., 123 or https://github.com/figma/figma/pull/123)
+        /// PR number or GitHub PR URL (e.g., 123 or https://github.com/org/repo/pull/123)
         pr: String,
 
         /// Skip spawning claude after creating the worktree
         #[arg(long)]
         no_claude: bool,
 
-        /// Path to the main figma repo (default: ~/figma/figma)
+        /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
     },
@@ -77,19 +77,19 @@ enum Commands {
         #[arg(long)]
         claude_prompt: Option<PathBuf>,
 
-        /// Path to the main figma repo (default: ~/figma/figma)
+        /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
     },
     /// List all worktrees and their status
     Status {
-        /// Path to the main figma repo (default: ~/figma/figma)
+        /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
     },
     /// Remove worktrees that have no uncommitted changes
     Clean {
-        /// Path to the main figma repo (default: ~/figma/figma)
+        /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
 
@@ -259,12 +259,20 @@ fn pick_available_color(current_worktree: &PathBuf) -> String {
     COLOR_PALETTE[hash % COLOR_PALETTE.len()].to_string()
 }
 
+fn default_repo_root() -> PathBuf {
+    PathBuf::from(env::var("CHECKOUT_REPO").expect("CHECKOUT_REPO env var must be set"))
+}
+
+fn default_worktree_dir() -> PathBuf {
+    PathBuf::from(env::var("CHECKOUT_WORKTREE_DIR").expect("CHECKOUT_WORKTREE_DIR env var must be set"))
+}
+
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/darren:checkout-pr"),
-        Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/darren:checkout-and-review-pr"),
+        Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr"),
+        Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-and-review-pr"),
         Commands::Branch { name, no_claude, claude_prompt, repo } => run_branch(&name, no_claude, claude_prompt, repo),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
@@ -279,8 +287,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
         pr_number.to_string().cyan()
     );
 
-    let home = env::var("HOME").map_err(|_| "HOME not set")?;
-    let repo_root = repo.unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
+    let repo_root = repo.unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
         return Err(format!("Repo not found at {}", repo_root.display()));
@@ -303,7 +310,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
     );
 
     let slug = create_slug(&pr_details.title);
-    let worktree_dir = PathBuf::from(format!("{}/figma-worktrees", home));
+    let worktree_dir = default_worktree_dir();
     let worktree_path = worktree_dir.join(format!("pr-{}-{}", pr_number, slug));
 
     let existing = find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?;
@@ -406,8 +413,7 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
         branch_name.cyan()
     );
 
-    let home = env::var("HOME").map_err(|_| "HOME not set")?;
-    let repo_root = repo.unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
+    let repo_root = repo.unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
         return Err(format!("Repo not found at {}", repo_root.display()));
@@ -415,7 +421,7 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
 
     // Create slug from branch name (strip any prefix like darren/ for the directory name)
     let slug = branch_name.rsplit('/').next().unwrap_or(&branch_name);
-    let worktree_dir = PathBuf::from(format!("{}/figma-worktrees", home));
+    let worktree_dir = default_worktree_dir();
     let worktree_path = worktree_dir.join(format!("branch-{}", slug));
 
     // Check if worktree already exists
@@ -584,8 +590,7 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
 }
 
 fn run_status(repo: Option<PathBuf>) -> Result<(), String> {
-    let home = env::var("HOME").map_err(|_| "HOME not set")?;
-    let repo_root = repo.unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
+    let repo_root = repo.unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
         return Err(format!("Repo not found at {}", repo_root.display()));
@@ -641,8 +646,7 @@ fn run_status(repo: Option<PathBuf>) -> Result<(), String> {
 }
 
 fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
-    let home = env::var("HOME").map_err(|_| "HOME not set")?;
-    let repo_root = repo.unwrap_or_else(|| PathBuf::from(format!("{}/figma/figma", home)));
+    let repo_root = repo.unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
         return Err(format!("Repo not found at {}", repo_root.display()));
