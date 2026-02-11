@@ -153,9 +153,34 @@ Spawn a teammate with this prompt:
 >
 > Output each finding with the file path relative to the working directory with line number (e.g., src/test.rs:45), explain why the test is redundant or low-value, and suggest whether to remove or consolidate. If all tests add value, output "All tests add value."
 
-### Teammate 6: Protocol Consistency Reviewer (only if multiplayer PR)
+### Teammate 6: Coherence Reviewer
 
-**Only spawn this teammate if the PR touches multiplayer code.**
+Spawn a teammate with this prompt:
+
+> Review this PR for coherence — does the implementation actually accomplish what the PR claims to do? Read the PR title and body (provided via `gh pr view`) and compare against the actual diff.
+>
+> Look for:
+> - **Incomplete implementation**: Features described in the PR body that aren't actually implemented in the diff
+> - **Commented-out code**: Tests or logic that was commented out rather than fixed (e.g., `// TODO: fix later`, `// skipping for now`)
+> - **Disabled tests**: Tests marked as `#[ignore]`, `.skip()`, `xit(`, `xdescribe(`, or similar — especially if they were previously enabled
+> - **Deferred logic**: `todo!()`, `unimplemented!()`, `// FIXME`, placeholder implementations, or stubbed-out functions that return hardcoded values
+> - **Scope drift**: Changes unrelated to the stated goal of the PR that snuck in without explanation
+> - **Contradictions**: The PR body says one thing but the code does another (e.g., "removes feature X" but feature X is still partially present)
+> - **Hardcoded workarounds**: Magic numbers, hardcoded paths, or temporary hacks that bypass the proper solution
+> - **Silent behavior changes**: Functions that now silently swallow errors, return early, or skip logic without explanation
+>
+> These are classic patterns when an LLM (or a tired human) takes shortcuts to get a PR to "work" without fully completing the task.
+>
+> Do NOT flag:
+> - Intentional `todo!()` or `unimplemented!()` that are explicitly called out in the PR body as planned follow-ups
+> - Pre-existing disabled tests unrelated to this PR
+> - Reasonable scope limitations that are acknowledged in the PR description
+>
+> Output each finding with the file path relative to the working directory with line number (e.g., src/file.ts:123), what the shortcut is, and why it doesn't align with the PR's stated goal. If the PR is coherent, output "PR implementation is coherent with its stated goals."
+
+### Teammate 7: Protocol Consistency Reviewer (only if multiplayer PR)
+
+**Only spawn this teammate if the PR touches multiplayer code.** (Teammate 7 because Teammate 6 is the Coherence Reviewer above.)
 
 Spawn a teammate with this prompt:
 
@@ -198,8 +223,11 @@ Wait for all teammates to complete their reviews. Then synthesize their findings
 ### Test Value
 [Teammate 5 findings]
 
-### Protocol Consistency (if applicable)
+### Coherence
 [Teammate 6 findings]
+
+### Protocol Consistency (if applicable)
+[Teammate 7 findings]
 
 ---
 
