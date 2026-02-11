@@ -73,6 +73,10 @@ enum Commands {
         #[arg(long)]
         no_claude: bool,
 
+        /// Path to a file whose contents will be used as the initial Claude prompt
+        #[arg(long)]
+        claude_prompt: Option<PathBuf>,
+
         /// Path to the main figma repo (default: ~/figma/figma)
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -260,7 +264,7 @@ fn run() -> Result<(), String> {
     match cli.command {
         Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/darren:checkout-pr"),
         Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/darren:checkout-and-review-pr"),
-        Commands::Branch { name, no_claude, repo } => run_branch(&name, no_claude, repo),
+        Commands::Branch { name, no_claude, claude_prompt, repo } => run_branch(&name, no_claude, claude_prompt, repo),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
     }
@@ -377,7 +381,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
     Ok(())
 }
 
-fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), String> {
+fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf>) -> Result<(), String> {
     // Ensure branch name has darren/ prefix
     let branch_name = if name.starts_with("darren/") {
         name.to_string()
@@ -455,6 +459,14 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
             "&& claude".dimmed()
         );
     } else {
+        let prompt = if let Some(prompt_path) = claude_prompt {
+            let content = fs::read_to_string(&prompt_path)
+                .map_err(|e| format!("Failed to read prompt file {}: {}", prompt_path.display(), e))?;
+            Some(content)
+        } else {
+            None
+        };
+
         println!();
         println!(
             "{} Spawning claude...",
@@ -468,7 +480,11 @@ fn run_branch(name: &str, no_claude: bool, repo: Option<PathBuf>) -> Result<(), 
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
         let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
 
-        spawn_claude(&final_path)?;
+        if let Some(prompt) = &prompt {
+            spawn_claude_with_prompt(&final_path, prompt)?;
+        } else {
+            spawn_claude(&final_path)?;
+        }
     }
 
     Ok(())
@@ -612,28 +628,48 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    println!(
-        "{} {} worktree(s) found:\n",
-        "→".blue().bold(),
-        worktrees.len()
-    );
+    let clean_worktrees: Vec<_> = worktrees.iter().filter(|w| !w.has_changes).collect();
+    let modified_worktrees: Vec<_> = worktrees.iter().filter(|w| w.has_changes).collect();
 
-    for wt in &worktrees {
-        let dir_name = wt.path.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| wt.path.display().to_string());
+    if !clean_worktrees.is_empty() {
+        println!(
+            "{} Removing {} worktree(s):\n",
+            "→".blue().bold(),
+            clean_worktrees.len()
+        );
 
-        if wt.has_changes {
-            println!(
-                "  {} {} {}",
-                format!("[{}]", "modified".yellow().bold()),
-                dir_name.cyan(),
-                format!("({})", wt.branch).dimmed()
-            );
-        } else {
+        for wt in &clean_worktrees {
+            let dir_name = wt.path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| wt.path.display().to_string());
+
             println!(
                 "  {} {} {}",
                 format!("[{}]", "remove".red()),
+                dir_name.cyan(),
+                format!("({})", wt.branch).dimmed()
+            );
+        }
+    }
+
+    if !modified_worktrees.is_empty() {
+        if !clean_worktrees.is_empty() {
+            println!();
+        }
+        println!(
+            "{} Keeping {} worktree(s) with uncommitted changes:\n",
+            "→".blue().bold(),
+            modified_worktrees.len()
+        );
+
+        for wt in &modified_worktrees {
+            let dir_name = wt.path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| wt.path.display().to_string());
+
+            println!(
+                "  {} {} {}",
+                format!("[{}]", "modified".yellow().bold()),
                 dir_name.cyan(),
                 format!("({})", wt.branch).dimmed()
             );
@@ -764,6 +800,16 @@ fn create_new_worktree_from_remote(
         println!("{}", "done".green());
     }
 
+    // Symlink node_modules from the main repo
+    print!("{} Linking node_modules... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    let linked = symlink_node_modules(worktree_path, repo_root)?;
+    if linked == 0 {
+        println!("{}", "skipped (none found)".dimmed());
+    } else {
+        println!("{} ({} linked)", "done".green(), linked);
+    }
+
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
     std::io::stdout().flush().ok();
@@ -815,6 +861,16 @@ fn create_new_worktree_new_branch(
     std::io::stdout().flush().ok();
     run_gt_track(worktree_path)?;
     println!("{}", "done".green());
+
+    // Symlink node_modules from the main repo
+    print!("{} Linking node_modules... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    let linked = symlink_node_modules(worktree_path, repo_root)?;
+    if linked == 0 {
+        println!("{}", "skipped (none found)".dimmed());
+    } else {
+        println!("{} ({} linked)", "done".green(), linked);
+    }
 
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
@@ -1138,6 +1194,55 @@ fn run_gt_track(worktree_path: &PathBuf) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Find all node_modules directories in repo_root and symlink them into
+/// the worktree. Skips any nested inside other node_modules since those
+/// are already contained within the parent symlink. Returns the number
+/// of symlinks created.
+fn symlink_node_modules(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<usize, String> {
+    let output = Command::new("find")
+        .args([
+            repo_root.to_string_lossy().as_ref(),
+            "-name", "node_modules",
+            "-type", "d",
+            "-not", "-path", "*/node_modules/*/node_modules",
+            "-prune",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to find node_modules: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut count = 0;
+
+    for line in stdout.lines() {
+        let source = PathBuf::from(line.trim());
+        if !source.is_dir() {
+            continue;
+        }
+
+        let rel = source.strip_prefix(repo_root)
+            .map_err(|_| format!("Path {} not under repo root", source.display()))?;
+        let dest = worktree_path.join(rel);
+
+        if dest.exists() || dest.is_symlink() {
+            continue;
+        }
+
+        // Ensure parent directory exists in the worktree
+        if let Some(parent) = dest.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent dir {}: {}", parent.display(), e))?;
+            }
+        }
+
+        std::os::unix::fs::symlink(&source, &dest)
+            .map_err(|e| format!("Failed to symlink {}: {}", rel.display(), e))?;
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 fn copy_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
