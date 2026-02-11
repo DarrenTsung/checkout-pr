@@ -109,6 +109,7 @@ struct PrDetails {
 #[derive(Debug)]
 enum ExistingWorktreeAction {
     UseExisting,
+    ResumeSession,
     CreateNew,
 }
 
@@ -307,6 +308,8 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
 
     let existing = find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?;
 
+    let mut resume = false;
+
     let final_path = if let Some(existing_path) = existing {
         println!(
             "\n{} Worktree already exists at {}",
@@ -326,6 +329,10 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
         let action = prompt_existing_worktree_action(has_changes)?;
 
         match action {
+            ExistingWorktreeAction::ResumeSession => {
+                resume = true;
+                existing_path
+            }
             ExistingWorktreeAction::UseExisting => {
                 print!("{} Updating to latest... ", "→".blue().bold());
                 std::io::stdout().flush().ok();
@@ -360,22 +367,31 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
             "&& claude".dimmed()
         );
     } else {
-        let full_prompt = format!("{} {}", claude_prompt, pr_number);
-        println!();
-        println!(
-            "{} Spawning claude with {}...",
-            "→".blue().bold(),
-            full_prompt.cyan()
-        );
-        println!();
-
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
 
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
         let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", pr_details.head_ref_name));
 
-        spawn_claude_with_prompt(&final_path, &full_prompt)?;
+        if resume {
+            println!();
+            println!(
+                "{} Resuming last claude session...",
+                "→".blue().bold(),
+            );
+            println!();
+            spawn_claude_continue(&final_path)?;
+        } else {
+            let full_prompt = format!("{} {}", claude_prompt, pr_number);
+            println!();
+            println!(
+                "{} Spawning claude with {}...",
+                "→".blue().bold(),
+                full_prompt.cyan()
+            );
+            println!();
+            spawn_claude_with_prompt(&final_path, &full_prompt)?;
+        }
     }
 
     Ok(())
@@ -410,6 +426,8 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
     // Check if worktree already exists
     let existing = find_existing_worktree(&repo_root, &format!("branch-{}", slug))?;
 
+    let mut resume = false;
+
     let final_path = if let Some(existing_path) = existing {
         println!(
             "\n{} Worktree already exists at {}",
@@ -429,6 +447,10 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
         let action = prompt_existing_worktree_action(has_changes)?;
 
         match action {
+            ExistingWorktreeAction::ResumeSession => {
+                resume = true;
+                existing_path
+            }
             ExistingWorktreeAction::UseExisting => {
                 existing_path
             }
@@ -459,31 +481,41 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
             "&& claude".dimmed()
         );
     } else {
-        let prompt = if let Some(prompt_path) = claude_prompt {
-            let content = fs::read_to_string(&prompt_path)
-                .map_err(|e| format!("Failed to read prompt file {}: {}", prompt_path.display(), e))?;
-            Some(content)
-        } else {
-            None
-        };
-
-        println!();
-        println!(
-            "{} Spawning claude...",
-            "→".blue().bold(),
-        );
-        println!();
-
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
 
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
         let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
 
-        if let Some(prompt) = &prompt {
-            spawn_claude_with_prompt(&final_path, prompt)?;
+        if resume {
+            println!();
+            println!(
+                "{} Resuming last claude session...",
+                "→".blue().bold(),
+            );
+            println!();
+            spawn_claude_continue(&final_path)?;
         } else {
-            spawn_claude(&final_path)?;
+            let prompt = if let Some(prompt_path) = claude_prompt {
+                let content = fs::read_to_string(&prompt_path)
+                    .map_err(|e| format!("Failed to read prompt file {}: {}", prompt_path.display(), e))?;
+                Some(content)
+            } else {
+                None
+            };
+
+            println!();
+            println!(
+                "{} Spawning claude...",
+                "→".blue().bold(),
+            );
+            println!();
+
+            if let Some(prompt) = &prompt {
+                spawn_claude_with_prompt(&final_path, prompt)?;
+            } else {
+                spawn_claude(&final_path)?;
+            }
         }
     }
 
@@ -901,18 +933,30 @@ fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktree
     println!();
     if has_changes {
         println!(
-            "  {} Use existing worktree {}",
+            "  {} Resume last claude session {}",
             "[1]".cyan().bold(),
+            "(keep changes, skip update)".dimmed()
+        );
+        println!(
+            "  {} Use existing worktree {}",
+            "[2]".cyan().bold(),
             "(will discard uncommitted changes!)".yellow()
         );
+        println!("  {} Create new worktree", "[3]".cyan().bold());
     } else {
         println!("  {} Use existing worktree", "[1]".cyan().bold());
+        println!("  {} Create new worktree", "[2]".cyan().bold());
     }
-    println!("  {} Create new worktree", "[2]".cyan().bold());
     println!();
 
+    let valid_options = if has_changes { "1, 2, or 3" } else { "1 or 2" };
+
     loop {
-        print!("{} Choose an option [1/2]: ", "?".magenta().bold());
+        if has_changes {
+            print!("{} Choose an option [1/2/3]: ", "?".magenta().bold());
+        } else {
+            print!("{} Choose an option [1/2]: ", "?".magenta().bold());
+        }
         io::stdout().flush().map_err(|e| e.to_string())?;
 
         let mut input = String::new();
@@ -920,9 +964,10 @@ fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktree
             .read_line(&mut input)
             .map_err(|e| format!("Failed to read input: {}", e))?;
 
-        match input.trim() {
-            "1" => {
-                if has_changes {
+        if has_changes {
+            match input.trim() {
+                "1" => return Ok(ExistingWorktreeAction::ResumeSession),
+                "2" => {
                     print!(
                         "{} Are you sure you want to discard changes? [y/N]: ",
                         "!".yellow().bold()
@@ -938,12 +983,20 @@ fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktree
                         println!("{} Cancelled", "→".blue().bold());
                         continue;
                     }
+                    return Ok(ExistingWorktreeAction::UseExisting);
                 }
-                return Ok(ExistingWorktreeAction::UseExisting);
+                "3" => return Ok(ExistingWorktreeAction::CreateNew),
+                _ => {
+                    println!("{} Invalid option, please enter {}", "!".red().bold(), valid_options);
+                }
             }
-            "2" => return Ok(ExistingWorktreeAction::CreateNew),
-            _ => {
-                println!("{} Invalid option, please enter 1 or 2", "!".red().bold());
+        } else {
+            match input.trim() {
+                "1" => return Ok(ExistingWorktreeAction::UseExisting),
+                "2" => return Ok(ExistingWorktreeAction::CreateNew),
+                _ => {
+                    println!("{} Invalid option, please enter {}", "!".red().bold(), valid_options);
+                }
             }
         }
     }
@@ -1367,6 +1420,22 @@ fn spawn_claude_with_prompt(worktree_path: &PathBuf, prompt: &str) -> Result<(),
     let status = Command::new("claude")
         .args(["--permission-mode", "acceptEdits"])
         .arg(prompt)
+        .current_dir(worktree_path)
+        .status()
+        .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+
+    if !status.success() {
+        return Err("claude exited with error".to_string());
+    }
+
+    Ok(())
+}
+
+fn spawn_claude_continue(worktree_path: &PathBuf) -> Result<(), String> {
+    set_terminal_cwd(worktree_path);
+
+    let status = Command::new("claude")
+        .args(["--permission-mode", "acceptEdits", "--continue"])
         .current_dir(worktree_path)
         .status()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
