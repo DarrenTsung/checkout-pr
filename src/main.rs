@@ -66,7 +66,7 @@ enum Commands {
     },
     /// Create a new branch in a worktree
     Branch {
-        /// Branch name (will be prefixed with darren/ if not already)
+        /// Branch name (e.g. darren/my-feature)
         name: String,
 
         /// Skip spawning claude after creating the worktree
@@ -398,12 +398,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
 }
 
 fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf>) -> Result<(), String> {
-    // Ensure branch name has darren/ prefix
-    let branch_name = if name.starts_with("darren/") {
-        name.to_string()
-    } else {
-        format!("darren/{}", name)
-    };
+    let branch_name = name.to_string();
 
     println!(
         "{} Branch {}",
@@ -418,8 +413,8 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
         return Err(format!("Repo not found at {}", repo_root.display()));
     }
 
-    // Create slug from branch name (remove darren/ prefix for the slug)
-    let slug = branch_name.strip_prefix("darren/").unwrap_or(&branch_name);
+    // Create slug from branch name (strip any prefix like darren/ for the directory name)
+    let slug = branch_name.rsplit('/').next().unwrap_or(&branch_name);
     let worktree_dir = PathBuf::from(format!("{}/figma-worktrees", home));
     let worktree_path = worktree_dir.join(format!("branch-{}", slug));
 

@@ -6,7 +6,7 @@ A CLI tool for managing git worktrees with Claude Code integration. Creates isol
 
 - **`checkout pr <number|url>`** — Check out a GitHub PR into a worktree
 - **`checkout review <number|url>`** — Check out a PR and start a code review
-- **`checkout branch <name>`** — Create a new branch in a worktree (auto-prefixes `darren/`)
+- **`checkout branch <name>`** — Create a new branch in a worktree
 - **`checkout status`** — List all worktrees and their status
 - **`checkout clean`** — Remove worktrees with no uncommitted changes
 
@@ -19,10 +19,16 @@ Each worktree gets:
 ## Install
 
 ```sh
+cargo install --path .
+```
+
+Or, if you're making frequent changes and don't want to reinstall each time:
+
+```sh
 ./install.sh
 ```
 
-This adds a `checkout` shell function to your `.zshrc`/`.bashrc`.
+This adds a shell function that builds from source on each invocation.
 
 ## Options
 
