@@ -1365,6 +1365,7 @@ fn spawn_claude_with_prompt(worktree_path: &PathBuf, prompt: &str) -> Result<(),
     set_terminal_cwd(worktree_path);
 
     let status = Command::new("claude")
+        .args(["--permission-mode", "acceptEdits"])
         .arg(prompt)
         .current_dir(worktree_path)
         .status()
@@ -1381,6 +1382,7 @@ fn spawn_claude(worktree_path: &PathBuf) -> Result<(), String> {
     set_terminal_cwd(worktree_path);
 
     let status = Command::new("claude")
+        .args(["--permission-mode", "acceptEdits"])
         .current_dir(worktree_path)
         .status()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
