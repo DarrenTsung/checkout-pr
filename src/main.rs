@@ -844,7 +844,7 @@ fn create_new_worktree_from_remote(
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    copy_claude_settings(worktree_path, repo_root)?;
+    symlink_claude_settings(worktree_path, repo_root)?;
     println!("{}", "done".green());
 
     // Add claude trust
@@ -906,7 +906,7 @@ fn create_new_worktree_new_branch(
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    copy_claude_settings(worktree_path, repo_root)?;
+    symlink_claude_settings(worktree_path, repo_root)?;
     println!("{}", "done".green());
 
     // Add claude trust
@@ -1297,12 +1297,12 @@ fn symlink_node_modules(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<
     Ok(count)
 }
 
-fn copy_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
-    // Copy the main repo's .claude/settings.local.json to the worktree
+fn symlink_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
+    // Symlink the main repo's .claude/settings.local.json into the worktree
     // This contains MCP server configurations and other local settings
     let source = repo_root.join(".claude/settings.local.json");
 
-    if !source.exists() {
+    let resolved_source = if !source.exists() {
         // Fall back to global settings if repo-specific doesn't exist
         let home = env::var("HOME").map_err(|_| "HOME not set")?;
         let global_source = PathBuf::from(format!("{}/.claude/settings.local.json", home));
@@ -1311,24 +1311,25 @@ fn copy_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<
             return Ok(());
         }
 
-        let dest_dir = worktree_path.join(".claude");
-        fs::create_dir_all(&dest_dir)
-            .map_err(|e| format!("Failed to create .claude dir: {}", e))?;
-
-        let dest = dest_dir.join("settings.local.json");
-        fs::copy(&global_source, &dest)
-            .map_err(|e| format!("Failed to copy claude settings: {}", e))?;
-
-        return Ok(());
-    }
+        global_source
+    } else {
+        source
+    };
 
     let dest_dir = worktree_path.join(".claude");
     fs::create_dir_all(&dest_dir)
         .map_err(|e| format!("Failed to create .claude dir: {}", e))?;
 
     let dest = dest_dir.join("settings.local.json");
-    fs::copy(&source, &dest)
-        .map_err(|e| format!("Failed to copy claude settings: {}", e))?;
+
+    // Remove existing file/symlink if present so we can create a fresh symlink
+    if dest.exists() || dest.symlink_metadata().is_ok() {
+        fs::remove_file(&dest)
+            .map_err(|e| format!("Failed to remove existing settings file: {}", e))?;
+    }
+
+    std::os::unix::fs::symlink(&resolved_source, &dest)
+        .map_err(|e| format!("Failed to symlink claude settings: {}", e))?;
 
     Ok(())
 }
