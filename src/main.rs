@@ -96,6 +96,7 @@ enum Commands {
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
+
     },
 }
 
@@ -523,13 +524,108 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
     Ok(())
 }
 
+#[derive(Clone)]
 struct WorktreeInfo {
     path: PathBuf,
     branch: String,
     has_changes: bool,
+    has_active_session: bool,
+    orphaned_pids: Vec<u32>,
+}
+
+struct ClaudeSession {
+    pid: u32,
+    cwd: PathBuf,
+    has_terminal: bool,
+}
+
+/// Find all running `claude` processes with their CWDs and terminal status.
+/// Uses pgrep to find PIDs (since the binary name seen by lsof is the
+/// version number, not "claude"), ps to check terminal attachment, and
+/// lsof to resolve CWDs.
+fn get_claude_sessions() -> Vec<ClaudeSession> {
+    // pgrep -x matches the exact process name shown by ps
+    let pgrep_output = Command::new("pgrep")
+        .args(["-x", "claude"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let pids_str = match pgrep_output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => return Vec::new(),
+    };
+
+    if pids_str.is_empty() {
+        return Vec::new();
+    }
+
+    let pids: Vec<u32> = pids_str
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
+    // Check which PIDs have a controlling terminal via ps
+    let pid_args: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+    let ps_output = Command::new("ps")
+        .args(["-o", "pid=,tty=", "-p"])
+        .arg(pid_args.join(","))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let mut has_terminal_map = std::collections::HashMap::new();
+    if let Ok(output) = ps_output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if let Some(pid) = parts.first().and_then(|p| p.parse::<u32>().ok()) {
+                let tty = parts.get(1).unwrap_or(&"??");
+                has_terminal_map.insert(pid, *tty != "??" && *tty != "-");
+            }
+        }
+    }
+
+    // Resolve CWDs via lsof
+    let pid_arg = pid_args.join(",");
+    let lsof_output = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-p", &pid_arg, "-Fn"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let mut sessions = Vec::new();
+    if let Ok(output) = lsof_output {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut current_pid: Option<u32> = None;
+
+        for line in stdout.lines() {
+            if let Some(pid_str) = line.strip_prefix('p') {
+                current_pid = pid_str.parse().ok();
+            } else if let Some(path) = line.strip_prefix('n') {
+                if let Some(pid) = current_pid {
+                    sessions.push(ClaudeSession {
+                        pid,
+                        cwd: PathBuf::from(path),
+                        has_terminal: *has_terminal_map.get(&pid).unwrap_or(&false),
+                    });
+                }
+            }
+        }
+    }
+
+    sessions
 }
 
 fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
+    let claude_sessions = get_claude_sessions();
+
     let output = Command::new("git")
         .args(["-C", &repo_root.to_string_lossy(), "worktree", "list", "--porcelain"])
         .output()
@@ -579,7 +675,12 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
                 .and_then(|c| c.wait_with_output())
                 .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
                 .unwrap_or(false);
-            WorktreeInfo { path, branch, has_changes }
+            let has_active_session = claude_sessions.iter().any(|s| s.has_terminal && s.cwd.starts_with(&path));
+            let orphaned_pids: Vec<u32> = claude_sessions.iter()
+                .filter(|s| !s.has_terminal && s.cwd.starts_with(&path))
+                .map(|s| s.pid)
+                .collect();
+            WorktreeInfo { path, branch, has_changes, has_active_session, orphaned_pids }
         })
         .collect();
 
@@ -610,8 +711,12 @@ fn run_status(repo: Option<PathBuf>) -> Result<(), String> {
     );
 
     for wt in &worktrees {
-        let status = if wt.has_changes {
+        let status = if wt.has_active_session {
+            "active".blue().bold()
+        } else if wt.has_changes {
             "modified".yellow().bold()
+        } else if !wt.orphaned_pids.is_empty() {
+            "orphaned".magenta().bold()
         } else {
             "clean".green()
         };
@@ -645,6 +750,88 @@ fn run_status(repo: Option<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(), String> {
+    let mut removed_count = 0;
+    let mut failed: Vec<String> = Vec::new();
+
+    for wt in worktrees {
+        let dir_name = wt.path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| wt.path.display().to_string());
+
+        // Kill orphaned claude processes before removing
+        for pid in &wt.orphaned_pids {
+            print!(
+                "{} Killing orphaned claude process (pid {})... ",
+                "→".blue().bold(),
+                pid.to_string().dimmed()
+            );
+            std::io::stdout().flush().ok();
+
+            let kill_result = Command::new("kill")
+                .arg(pid.to_string())
+                .status();
+
+            match kill_result {
+                Ok(s) if s.success() => println!("{}", "done".green()),
+                _ => println!("{}", "failed (may have already exited)".yellow()),
+            }
+        }
+
+        print!("{} Removing {}... ", "→".blue().bold(), dir_name.cyan());
+        std::io::stdout().flush().ok();
+
+        // Force-remove for worktrees with uncommitted changes
+        let repo_str = repo_root.to_string_lossy();
+        let wt_str = wt.path.to_string_lossy();
+        let mut args = vec!["-C", &repo_str, "worktree", "remove"];
+        if wt.has_changes {
+            args.push("--force");
+        }
+        args.push(&wt_str);
+
+        let output = Command::new("git")
+            .args(&args)
+            .output()
+            .map_err(|e| format!("Failed to remove worktree: {}", e))?;
+
+        if output.status.success() {
+            let color_file = worktree_color_file(&wt.path);
+            let _ = fs::remove_file(color_file);
+
+            println!("{}", "done".green());
+            removed_count += 1;
+        } else {
+            println!("{}", "failed".red());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let error_msg = stderr.trim();
+            if !error_msg.is_empty() {
+                println!("    {} {}", "error:".red(), error_msg);
+            }
+            failed.push(dir_name);
+        }
+    }
+
+    if removed_count > 0 {
+        println!(
+            "{} Removed {} worktree(s)",
+            "✓".green().bold(),
+            removed_count
+        );
+    }
+
+    if !failed.is_empty() {
+        println!(
+            "{} Failed to remove {} worktree(s): {}",
+            "✗".red().bold(),
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
     let repo_root = repo.unwrap_or_else(default_repo_root);
 
@@ -659,24 +846,63 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let clean_worktrees: Vec<_> = worktrees.iter().filter(|w| !w.has_changes).collect();
-    let modified_worktrees: Vec<_> = worktrees.iter().filter(|w| w.has_changes).collect();
+    // Removable = no uncommitted changes AND no active (terminal-attached) session.
+    // Orphaned claude processes (no terminal) will be killed before removal.
+    let removable_worktrees: Vec<_> = worktrees.iter().filter(|w| !w.has_changes && !w.has_active_session).collect();
+    let modified_worktrees: Vec<_> = worktrees.iter().filter(|w| w.has_changes && !w.has_active_session).collect();
+    let active_worktrees: Vec<_> = worktrees.iter().filter(|w| w.has_active_session).collect();
 
-    if !clean_worktrees.is_empty() {
+    if !removable_worktrees.is_empty() {
         println!(
             "{} Removing {} worktree(s):\n",
             "→".blue().bold(),
-            clean_worktrees.len()
+            removable_worktrees.len()
         );
 
-        for wt in &clean_worktrees {
+        for wt in &removable_worktrees {
+            let dir_name = wt.path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| wt.path.display().to_string());
+
+            let orphan_note = if !wt.orphaned_pids.is_empty() {
+                format!(
+                    " {} {}",
+                    format!("(killing {} orphaned claude process{})", wt.orphaned_pids.len(),
+                        if wt.orphaned_pids.len() == 1 { "" } else { "es" }).yellow(),
+                    format!("pid {}", wt.orphaned_pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")).dimmed()
+                )
+            } else {
+                String::new()
+            };
+
+            println!(
+                "  {} {} {}{}",
+                format!("[{}]", "remove".red()),
+                dir_name.cyan(),
+                format!("({})", wt.branch).dimmed(),
+                orphan_note
+            );
+        }
+    }
+
+    if !active_worktrees.is_empty() {
+        if !removable_worktrees.is_empty() {
+            println!();
+        }
+        println!(
+            "{} Keeping {} worktree(s) with active Claude sessions:\n",
+            "→".blue().bold(),
+            active_worktrees.len()
+        );
+
+        for wt in &active_worktrees {
             let dir_name = wt.path.file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| wt.path.display().to_string());
 
             println!(
                 "  {} {} {}",
-                format!("[{}]", "remove".red()),
+                format!("[{}]", "active".blue().bold()),
                 dir_name.cyan(),
                 format!("({})", wt.branch).dimmed()
             );
@@ -684,11 +910,11 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
     }
 
     if !modified_worktrees.is_empty() {
-        if !clean_worktrees.is_empty() {
+        if !removable_worktrees.is_empty() || !active_worktrees.is_empty() {
             println!();
         }
         println!(
-            "{} Keeping {} worktree(s) with uncommitted changes:\n",
+            "{} {} worktree(s) with uncommitted changes (will prompt individually):\n",
             "→".blue().bold(),
             modified_worktrees.len()
         );
@@ -707,91 +933,75 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         }
     }
 
-    let clean_worktrees: Vec<_> = worktrees.into_iter().filter(|w| !w.has_changes).collect();
+    // Partition into owned vecs before we need them for removal
+    let (removable, modified): (Vec<_>, Vec<_>) = worktrees.into_iter()
+        .filter(|w| !w.has_active_session)
+        .partition(|w| !w.has_changes);
 
-    if clean_worktrees.is_empty() {
-        println!("\n{} All worktrees have uncommitted changes, nothing to remove", "→".blue().bold());
+    if removable.is_empty() && modified.is_empty() {
+        println!("\n{} Nothing to remove", "→".blue().bold());
         return Ok(());
     }
 
-    if !skip_confirm {
-        println!();
-        print!(
-            "{} Remove these worktrees? [y/N]: ",
-            "?".magenta().bold()
-        );
-        io::stdout().flush().map_err(|e| e.to_string())?;
+    // Batch-confirm and remove clean worktrees
+    if !removable.is_empty() {
+        if !skip_confirm {
+            println!();
+            print!(
+                "{} Remove {} clean worktree(s)? [y/N]: ",
+                "?".magenta().bold(),
+                removable.len()
+            );
+            io::stdout().flush().map_err(|e| e.to_string())?;
 
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| format!("Failed to read input: {}", e))?;
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| format!("Failed to read input: {}", e))?;
 
-        if input.trim().to_lowercase() != "y" {
-            println!("{} Cancelled", "→".blue().bold());
-            return Ok(());
-        }
-    }
-
-    println!();
-
-    let mut removed_count = 0;
-    let mut failed: Vec<String> = Vec::new();
-
-    for wt in &clean_worktrees {
-        let dir_name = wt.path.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| wt.path.display().to_string());
-
-        print!("{} Removing {}... ", "→".blue().bold(), dir_name.cyan());
-        std::io::stdout().flush().ok();
-
-        // Remove worktree using git
-        let output = Command::new("git")
-            .args([
-                "-C",
-                &repo_root.to_string_lossy(),
-                "worktree",
-                "remove",
-                &wt.path.to_string_lossy(),
-            ])
-            .output()
-            .map_err(|e| format!("Failed to remove worktree: {}", e))?;
-
-        if output.status.success() {
-            // Also remove the color file
-            let color_file = worktree_color_file(&wt.path);
-            let _ = fs::remove_file(color_file);
-
-            println!("{}", "done".green());
-            removed_count += 1;
-        } else {
-            println!("{}", "failed".red());
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let error_msg = stderr.trim();
-            if !error_msg.is_empty() {
-                println!("    {} {}", "error:".red(), error_msg);
+            if input.trim().to_lowercase() == "y" {
+                println!();
+                remove_worktrees(&removable, &repo_root)?;
             }
-            failed.push(dir_name);
+        } else {
+            println!();
+            remove_worktrees(&removable, &repo_root)?;
         }
     }
 
-    println!();
-    if removed_count > 0 {
-        println!(
-            "{} Removed {} worktree(s)",
-            "✓".green().bold(),
-            removed_count
-        );
-    }
+    // Prompt individually for modified worktrees, then remove all confirmed ones
+    if !modified.is_empty() {
+        println!();
+        let mut to_remove: Vec<&WorktreeInfo> = Vec::new();
 
-    if !failed.is_empty() {
-        println!(
-            "{} Failed to remove {} worktree(s): {}",
-            "✗".red().bold(),
-            failed.len(),
-            failed.join(", ")
-        );
+        for wt in &modified {
+            let dir_name = wt.path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| wt.path.display().to_string());
+
+            print!(
+                "{} Remove {} {}? [y/N]: ",
+                "?".magenta().bold(),
+                dir_name.cyan(),
+                "(has uncommitted changes)".yellow()
+            );
+            io::stdout().flush().map_err(|e| e.to_string())?;
+
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| format!("Failed to read input: {}", e))?;
+
+            if input.trim().to_lowercase() == "y" {
+                to_remove.push(wt);
+            }
+        }
+
+        if !to_remove.is_empty() {
+            println!();
+            let owned: Vec<_> = to_remove.into_iter().cloned().collect();
+            remove_worktrees(&owned, &repo_root)?;
+        }
     }
 
     Ok(())
@@ -1269,7 +1479,7 @@ fn symlink_node_modules(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<
 
     for line in stdout.lines() {
         let source = PathBuf::from(line.trim());
-        if !source.is_dir() {
+        if !source.is_dir() || source.is_symlink() {
             continue;
         }
 
