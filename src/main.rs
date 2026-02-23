@@ -943,7 +943,10 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    // Batch-confirm and remove clean worktrees
+    // Collect all confirmations upfront before any removals
+    let mut all_to_remove: Vec<WorktreeInfo> = Vec::new();
+
+    // Batch-confirm clean worktrees
     if !removable.is_empty() {
         if !skip_confirm {
             println!();
@@ -960,21 +963,17 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
                 .map_err(|e| format!("Failed to read input: {}", e))?;
 
             if input.trim().to_lowercase() == "y" {
-                println!();
-                remove_worktrees(&removable, &repo_root)?;
+                all_to_remove.extend(removable);
             }
         } else {
-            println!();
-            remove_worktrees(&removable, &repo_root)?;
+            all_to_remove.extend(removable);
         }
     }
 
-    // Prompt individually for modified worktrees, then remove all confirmed ones
+    // Prompt individually for modified worktrees
     if !modified.is_empty() {
         println!();
-        let mut to_remove: Vec<&WorktreeInfo> = Vec::new();
-
-        for wt in &modified {
+        for wt in modified {
             let dir_name = wt.path.file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| wt.path.display().to_string());
@@ -993,15 +992,15 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
                 .map_err(|e| format!("Failed to read input: {}", e))?;
 
             if input.trim().to_lowercase() == "y" {
-                to_remove.push(wt);
+                all_to_remove.push(wt);
             }
         }
+    }
 
-        if !to_remove.is_empty() {
-            println!();
-            let owned: Vec<_> = to_remove.into_iter().cloned().collect();
-            remove_worktrees(&owned, &repo_root)?;
-        }
+    // Remove everything that was confirmed
+    if !all_to_remove.is_empty() {
+        println!();
+        remove_worktrees(&all_to_remove, &repo_root)?;
     }
 
     Ok(())
