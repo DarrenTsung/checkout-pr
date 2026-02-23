@@ -733,20 +733,6 @@ fn run_status(repo: Option<PathBuf>) -> Result<(), String> {
         );
     }
 
-    let clean_count = worktrees.iter().filter(|w| !w.has_changes).count();
-    let modified_count = worktrees.iter().filter(|w| w.has_changes).count();
-
-    println!();
-    if clean_count > 0 {
-        println!(
-            "{} {} clean worktree(s) can be removed with: {} {}",
-            "tip:".yellow().bold(),
-            clean_count,
-            "checkout clean".cyan(),
-            if modified_count > 0 { format!("({} with changes will be kept)", modified_count) } else { String::new() }.dimmed()
-        );
-    }
-
     Ok(())
 }
 
