@@ -276,6 +276,69 @@ fn pick_available_color(current_worktree: &PathBuf) -> String {
     COLOR_PALETTE[hash % COLOR_PALETTE.len()].to_string()
 }
 
+fn get_session_dir() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(format!("{}/.local/share/checkout/sessions", home))
+}
+
+fn session_pid_file(worktree_path: &Path) -> PathBuf {
+    let name = worktree_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    get_session_dir().join(format!("{}.pid", name))
+}
+
+fn write_session_pid(worktree_path: &Path, pid: u32) {
+    let dir = get_session_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(session_pid_file(worktree_path), pid.to_string());
+}
+
+fn remove_session_pid(worktree_path: &Path) {
+    let _ = fs::remove_file(session_pid_file(worktree_path));
+}
+
+fn read_session_pid(worktree_path: &Path) -> Option<u32> {
+    fs::read_to_string(session_pid_file(worktree_path))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// RAII guard that removes the PID file on drop (normal exit or panic).
+/// Ctrl+C bypasses Drop, but stale PID files are self-healing: the next
+/// `status`/`clean` run detects the dead PID and cleans up.
+struct PidFileGuard {
+    worktree_path: PathBuf,
+}
+
+impl PidFileGuard {
+    fn new(worktree_path: &Path, pid: u32) -> Self {
+        write_session_pid(worktree_path, pid);
+        Self {
+            worktree_path: worktree_path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        remove_session_pid(&self.worktree_path);
+    }
+}
+
 fn default_repo_root() -> PathBuf {
     PathBuf::from(env::var("CHECKOUT_REPO").expect("CHECKOUT_REPO env var must be set"))
 }
@@ -584,99 +647,7 @@ struct WorktreeInfo {
     orphaned_pids: Vec<u32>,
 }
 
-struct ClaudeSession {
-    pid: u32,
-    cwd: PathBuf,
-    has_terminal: bool,
-}
-
-/// Find all running `claude` processes with their CWDs and terminal status.
-/// Uses pgrep to find PIDs (since the binary name seen by lsof is the
-/// version number, not "claude"), ps to check terminal attachment, and
-/// lsof to resolve CWDs.
-fn get_claude_sessions() -> Vec<ClaudeSession> {
-    // pgrep -x matches the exact process name shown by ps
-    let pgrep_output = Command::new("pgrep")
-        .args(["-x", "claude"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
-    let pids_str = match pgrep_output {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        _ => return Vec::new(),
-    };
-
-    if pids_str.is_empty() {
-        return Vec::new();
-    }
-
-    let pids: Vec<u32> = pids_str
-        .lines()
-        .filter_map(|l| l.trim().parse().ok())
-        .collect();
-
-    if pids.is_empty() {
-        return Vec::new();
-    }
-
-    // Check which PIDs have a controlling terminal via ps
-    let pid_args: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
-    let ps_output = Command::new("ps")
-        .args(["-o", "pid=,tty=", "-p"])
-        .arg(pid_args.join(","))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
-    let mut has_terminal_map = std::collections::HashMap::new();
-    if let Ok(output) = ps_output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if let Some(pid) = parts.first().and_then(|p| p.parse::<u32>().ok()) {
-                let tty = parts.get(1).unwrap_or(&"??");
-                has_terminal_map.insert(pid, *tty != "??" && *tty != "-");
-            }
-        }
-    }
-
-    // Resolve CWDs via lsof
-    let pid_arg = pid_args.join(",");
-    let lsof_output = Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-p", &pid_arg, "-Fn"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
-    let mut sessions = Vec::new();
-    if let Ok(output) = lsof_output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut current_pid: Option<u32> = None;
-
-        for line in stdout.lines() {
-            if let Some(pid_str) = line.strip_prefix('p') {
-                current_pid = pid_str.parse().ok();
-            } else if let Some(path) = line.strip_prefix('n') {
-                if let Some(pid) = current_pid {
-                    sessions.push(ClaudeSession {
-                        pid,
-                        cwd: PathBuf::from(path),
-                        has_terminal: *has_terminal_map.get(&pid).unwrap_or(&false),
-                    });
-                }
-            }
-        }
-    }
-
-    sessions
-}
-
 fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
-    let claude_sessions = get_claude_sessions();
-
     let output = Command::new("git")
         .args(["-C", &repo_root.to_string_lossy(), "worktree", "list", "--porcelain"])
         .output()
@@ -726,11 +697,17 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
                 .and_then(|c| c.wait_with_output())
                 .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
                 .unwrap_or(false);
-            let has_active_session = claude_sessions.iter().any(|s| s.has_terminal && s.cwd.starts_with(&path));
-            let orphaned_pids: Vec<u32> = claude_sessions.iter()
-                .filter(|s| !s.has_terminal && s.cwd.starts_with(&path))
-                .map(|s| s.pid)
-                .collect();
+            let has_active_session = if let Some(pid) = read_session_pid(&path) {
+                if is_pid_alive(pid) {
+                    true
+                } else {
+                    remove_session_pid(&path); // stale PID file from a crash
+                    false
+                }
+            } else {
+                false
+            };
+            let orphaned_pids: Vec<u32> = Vec::new();
             WorktreeInfo { path, branch, has_changes, has_active_session, orphaned_pids }
         })
         .collect();
@@ -835,6 +812,7 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
         if output.status.success() {
             let color_file = worktree_color_file(&wt.path);
             let _ = fs::remove_file(color_file);
+            remove_session_pid(&wt.path);
 
             println!("{}", "done".green());
             removed_count += 1;
@@ -1891,10 +1869,13 @@ fn spawn_claude_with_prompt(worktree_path: &PathBuf, prompt: &str, append_system
     if let Some(system_prompt) = append_system_prompt {
         cmd.args(["--append-system-prompt", system_prompt]);
     }
-    let status = cmd
+    let mut child = cmd
         .current_dir(worktree_path)
-        .status()
+        .spawn()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+
+    let _pid_guard = PidFileGuard::new(worktree_path, child.id());
+    let status = child.wait().map_err(|e| format!("Failed to wait for claude: {}", e))?;
 
     if !status.success() {
         return Err("claude exited with error".to_string());
@@ -1911,10 +1892,13 @@ fn spawn_claude_continue(worktree_path: &PathBuf, append_system_prompt: Option<&
     if let Some(system_prompt) = append_system_prompt {
         cmd.args(["--append-system-prompt", system_prompt]);
     }
-    let status = cmd
+    let mut child = cmd
         .current_dir(worktree_path)
-        .status()
+        .spawn()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+
+    let _pid_guard = PidFileGuard::new(worktree_path, child.id());
+    let status = child.wait().map_err(|e| format!("Failed to wait for claude: {}", e))?;
 
     if !status.success() {
         return Err("claude exited with error".to_string());
@@ -1931,10 +1915,13 @@ fn spawn_claude(worktree_path: &PathBuf, append_system_prompt: Option<&str>) -> 
     if let Some(system_prompt) = append_system_prompt {
         cmd.args(["--append-system-prompt", system_prompt]);
     }
-    let status = cmd
+    let mut child = cmd
         .current_dir(worktree_path)
-        .status()
+        .spawn()
         .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+
+    let _pid_guard = PidFileGuard::new(worktree_path, child.id());
+    let status = child.wait().map_err(|e| format!("Failed to wait for claude: {}", e))?;
 
     if !status.success() {
         return Err("claude exited with error".to_string());
