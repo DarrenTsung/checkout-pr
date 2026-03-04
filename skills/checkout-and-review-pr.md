@@ -75,6 +75,7 @@ Spawn a teammate with this prompt:
 > - Missing tests for trivial changes (simple renames, formatting)
 > - Pre-existing test gaps unrelated to this PR
 > - Over-testing suggestions (testing implementation details)
+> - Coverage gaps where the code path is already exercised by existing tests, even if with a different input variant
 >
 > Output a list of coverage gaps. For each gap, include the file path relative to the working directory with line number (e.g., src/file.ts:123) and describe what test is needed. If coverage is adequate, output "Test coverage is adequate."
 
@@ -157,7 +158,7 @@ Spawn a teammate with this prompt:
 
 Spawn a teammate with this prompt:
 
-> Review this PR for coherence — does the implementation actually accomplish what the PR claims to do? Read the PR title and body (provided via `gh pr view`) and compare against the actual diff.
+> Review this PR for coherence — does the implementation actually accomplish what the PR claims to do, and does it avoid unnecessary work? Read the PR title and body (provided via `gh pr view`) and compare against the actual diff.
 >
 > Look for:
 > - **Incomplete implementation**: Features described in the PR body that aren't actually implemented in the diff
@@ -168,35 +169,44 @@ Spawn a teammate with this prompt:
 > - **Contradictions**: The PR body says one thing but the code does another (e.g., "removes feature X" but feature X is still partially present)
 > - **Hardcoded workarounds**: Magic numbers, hardcoded paths, or temporary hacks that bypass the proper solution
 > - **Silent behavior changes**: Functions that now silently swallow errors, return early, or skip logic without explanation
->
-> These are classic patterns when an LLM (or a tired human) takes shortcuts to get a PR to "work" without fully completing the task.
+> - **Unnecessary code**: Functions that handle cases that can never be reached from their call sites (e.g., an `Option` parameter that is always `Some`, a match arm for a variant that's never constructed). Check each function's callers to see if defensive branches are actually reachable.
+> - **Unnecessary work**: Redundant iterations over the same data that could be combined into a single pass, or computations that are performed unconditionally but only consumed conditionally
 >
 > Do NOT flag:
 > - Intentional `todo!()` or `unimplemented!()` that are explicitly called out in the PR body as planned follow-ups
 > - Pre-existing disabled tests unrelated to this PR
 > - Reasonable scope limitations that are acknowledged in the PR description
 >
-> Output each finding with the file path relative to the working directory with line number (e.g., src/file.ts:123), what the shortcut is, and why it doesn't align with the PR's stated goal. If the PR is coherent, output "PR implementation is coherent with its stated goals."
+> Output each finding with the file path relative to the working directory with line number (e.g., src/file.ts:123), what the issue is, and why it matters. If the PR is coherent, output "PR implementation is coherent with its stated goals."
 
-### Teammate 7: Protocol Consistency Reviewer (only if multiplayer PR)
+### Teammate 7: Multiplayer Reviewer (only if multiplayer PR)
 
-**Only spawn this teammate if the PR touches multiplayer code.** (Teammate 7 because Teammate 6 is the Coherence Reviewer above.)
+**Only spawn this teammate if the PR touches multiplayer code.**
 
 Spawn a teammate with this prompt:
 
-> Review this multiplayer PR for TypeScript/Rust protocol consistency.
+> Review this multiplayer PR for protocol consistency and multiplayer-specific patterns.
 >
-> Check that any protocol changes are synchronized between TypeScript and Rust:
+> **Protocol consistency:** Check that any protocol changes are synchronized between TypeScript and Rust:
 > 1. Message types defined in both languages should match
 > 2. Field names and types should be consistent
 > 3. Enum variants should match
 > 4. Serialization/deserialization should be compatible
+> 5. Proto schema files (in `figment/schemas/`) should be updated when analytics events gain new fields or new events are added
 >
 > Look at files in:
 > - TypeScript: Look for protocol definitions, message types, API contracts
 > - Rust: Look for corresponding structs, enums, and serde attributes
 >
-> Output any mismatches found between TS and Rust protocol definitions. For each mismatch, include file paths relative to the working directory with line numbers for both the TS and Rust locations (e.g., src/protocol.ts:45 and multiplayer/src/protocol.rs:78). If protocols are consistent, output "Protocol definitions are consistent."
+> **Kiwi/NodeChange performance patterns:** When code accesses fields on NodeChange or kiwi-generated types, check for:
+> - Using `get_*().is_some()` when `has_*()` exists — `get_*` decodes the field value which is more expensive than `has_*` which only checks for presence. Flag cases where the decoded value is not used.
+> - Unnecessary field decoding in hot loops — prefer existence checks over value extraction when only checking presence
+>
+> **Operational safety for hot paths:** If the PR adds new computation to the scenegraph query path, initial load path, or message handling path:
+> - Is the new work gated behind a LaunchDarkly feature flag for safe rollout/rollback?
+> - Could the computation be deferred or made async if it's not needed for the response?
+>
+> Output any issues found with file paths relative to the working directory and line numbers (e.g., src/protocol.ts:45 and multiplayer/src/protocol.rs:78). If no issues, output "No multiplayer-specific issues found."
 
 ---
 
@@ -226,7 +236,7 @@ Wait for all teammates to complete their reviews. Then synthesize their findings
 ### Coherence
 [Teammate 6 findings]
 
-### Protocol Consistency (if applicable)
+### Multiplayer (if applicable)
 [Teammate 7 findings]
 
 ---
@@ -255,7 +265,7 @@ When answering questions:
 When resolving comments, please DO NOT push the commit until approval by the user.
 
 Replying to PR review comments:
-- When the user asks you to reply to a review comment, use: `gh api -X POST repos/{owner}/{repo}/pulls/<PR_NUMBER>/comments -F body="<your_reply>" -F in_reply_to=<COMMENT_ID>`
-- The comment ID is the numeric ID from the review comment URL (e.g., https://github.com/{owner}/{repo}/pull/123#discussion_r12345 → comment ID is 12345)
-- Example: `gh api -X POST repos/{owner}/{repo}/pulls/123/comments -F body="Done in abc123def" -F in_reply_to=12345`
+- When the user asks you to reply to a review comment, use: `gh api -X POST repos/figma/figma/pulls/<PR_NUMBER>/comments -F body="<your_reply>" -F in_reply_to=<COMMENT_ID>`
+- The comment ID is the numeric ID from the review comment URL (e.g., https://github.com/figma/figma/pull/650848#discussion_r2678105376 → comment ID is 2678105376)
+- Example: `gh api -X POST repos/figma/figma/pulls/650848/comments -F body="Done in abc123def" -F in_reply_to=2678105376`
 - Note: Use `-F` (not `-f`) for the `in_reply_to` parameter since it must be passed as a number
