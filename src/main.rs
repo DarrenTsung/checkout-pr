@@ -1,15 +1,25 @@
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::ExecutableCommand;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Terminal;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::SystemTime;
 
 /// Color palette - subtle dark backgrounds with pastel hues
 const COLOR_PALETTE: &[&str] = &[
@@ -96,7 +106,12 @@ enum Commands {
         /// Skip confirmation prompt
         #[arg(long, short = 'y')]
         yes: bool,
-
+    },
+    /// Browse worktrees with Claude sessions and resume one
+    Resume {
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
 }
 
@@ -277,6 +292,7 @@ fn run() -> Result<(), String> {
         Commands::Branch { name, no_claude, claude_prompt, repo } => run_branch(&name, no_claude, claude_prompt, repo),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
+        Commands::Resume { repo } => run_resume(repo),
     }
 }
 
@@ -1656,4 +1672,723 @@ fn spawn_claude(worktree_path: &PathBuf) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ---------- resume subcommand ----------
+
+struct ChatMessage {
+    role: String,   // "user" or "assistant"
+    content: String,
+}
+
+struct SessionInfo {
+    last_modified: SystemTime,
+    messages: Vec<ChatMessage>,
+}
+
+struct WorktreeSession {
+    worktree: WorktreeInfo,
+    session: SessionInfo,
+}
+
+/// Encode a worktree path into the Claude projects directory name format.
+/// `/Users/dtsung/figma-worktrees/branch-foo` → `-Users-dtsung-figma-worktrees-branch-foo`
+fn encode_project_path(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "-")
+}
+
+/// Read the last `max_bytes` of a file and return complete lines from that tail.
+fn tail_lines(path: &Path, max_bytes: u64) -> Result<Vec<String>, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("stat {}: {}", path.display(), e))?;
+    let file_len = meta.len();
+
+    let file = fs::File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+
+    let start = if file_len > max_bytes { file_len - max_bytes } else { 0 };
+    let reader = io::BufReader::new(file);
+    let mut lines: Vec<String> = Vec::new();
+
+    // Skip to the start offset by reading bytes
+    use std::io::{Seek, SeekFrom};
+    let mut reader = reader;
+    reader.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+
+    // If we skipped into the middle of a file, discard the first (partial) line
+    if start > 0 {
+        let mut _discard = String::new();
+        reader.read_line(&mut _discard).ok();
+    }
+
+    for line in reader.lines() {
+        match line {
+            Ok(l) => lines.push(l),
+            Err(_) => break,
+        }
+    }
+
+    Ok(lines)
+}
+
+/// Parse JSONL lines to extract the last N user/assistant chat messages.
+fn parse_session_messages(jsonl_path: &Path, max_messages: usize) -> Vec<ChatMessage> {
+    // Read last ~256KB — plenty for recent messages
+    let lines = match tail_lines(jsonl_path, 256 * 1024) {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut messages: Vec<ChatMessage> = Vec::new();
+
+    for line in &lines {
+        let val: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match msg_type {
+            "user" => {
+                let content = val.get("message").and_then(|m| m.get("content"));
+                if let Some(content) = content {
+                    if let Some(text) = content.as_str() {
+                        let trimmed = text.trim_start();
+                        // Skip system/tool messages (XML tags, tool results)
+                        if !trimmed.starts_with('<') {
+                            messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: text.to_string(),
+                            });
+                        }
+                    }
+                    // Skip tool_result arrays — those aren't human messages
+                }
+            }
+            "assistant" => {
+                let content = val.get("message").and_then(|m| m.get("content"));
+                if let Some(arr) = content.and_then(|c| c.as_array()) {
+                    // Find the first text block (skip thinking blocks)
+                    for item in arr {
+                        let block_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if block_type == "text" {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                messages.push(ChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: text.to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Return the last N messages
+    let start = if messages.len() > max_messages { messages.len() - max_messages } else { 0 };
+    messages.split_off(start)
+}
+
+/// Find the most recent Claude session for a worktree path.
+fn find_worktree_session(worktree_path: &Path) -> Option<SessionInfo> {
+    let home = env::var("HOME").ok()?;
+    let encoded = encode_project_path(worktree_path);
+    let project_dir = PathBuf::from(format!("{}/.claude/projects/{}", home, encoded));
+
+    if !project_dir.is_dir() {
+        return None;
+    }
+
+    let mut best_path: Option<PathBuf> = None;
+    let mut best_time: Option<SystemTime> = None;
+
+    if let Ok(entries) = fs::read_dir(&project_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Ok(meta) = fs::metadata(&path) {
+                    if let Ok(modified) = meta.modified() {
+                        if best_time.is_none() || modified > best_time.unwrap() {
+                            best_time = Some(modified);
+                            best_path = Some(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let jsonl_path = best_path?;
+    let last_modified = best_time?;
+    let messages = parse_session_messages(&jsonl_path, 50);
+
+    if messages.is_empty() {
+        return None;
+    }
+
+    Some(SessionInfo { last_modified, messages })
+}
+
+/// Format a `SystemTime` as a human-readable "time ago" string.
+fn format_time_ago(time: SystemTime) -> String {
+    let elapsed = time.elapsed().unwrap_or_default();
+    let secs = elapsed.as_secs();
+
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m ago", mins);
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{}h ago", hours);
+    }
+    let days = hours / 24;
+    if days < 30 {
+        return format!("{}d ago", days);
+    }
+    let months = days / 30;
+    format!("{}mo ago", months)
+}
+
+/// Lightweight worktree listing: just parses `git worktree list --porcelain`
+/// without spawning any git-status or process-detection subcommands.
+fn list_worktree_paths(repo_root: &PathBuf) -> Result<Vec<(PathBuf, String)>, String> {
+    let output = Command::new("git")
+        .args(["-C", &repo_root.to_string_lossy(), "worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|e| format!("Failed to list worktrees: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut entries: Vec<(PathBuf, String)> = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+
+    for line in stdout.lines() {
+        if let Some(path_str) = line.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(path_str));
+        } else if let Some(branch_str) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(branch_str.to_string());
+        } else if line.is_empty() {
+            if let Some(path) = current_path.take() {
+                if path != *repo_root {
+                    let branch = current_branch.take().unwrap_or_else(|| "(detached)".to_string());
+                    entries.push((path, branch));
+                }
+            }
+            current_branch = None;
+        }
+    }
+
+    Ok(entries)
+}
+
+fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
+    let repo_root = repo.unwrap_or_else(default_repo_root);
+
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+
+    // Fast path: just list worktree paths (single git command, no status checks)
+    print!("{} Listing worktrees... ", "→".blue().bold());
+    io::stdout().flush().ok();
+    let entries = list_worktree_paths(&repo_root)?;
+    println!("{} ({} found)", "done".green(), entries.len());
+
+    if entries.is_empty() {
+        println!("{} No worktrees found", "→".blue().bold());
+        return Ok(());
+    }
+
+    // Find sessions via filesystem reads only — skip worktrees without sessions
+    print!("{} Finding Claude sessions... ", "→".blue().bold());
+    io::stdout().flush().ok();
+    let mut sessions: Vec<WorktreeSession> = entries
+        .into_iter()
+        .filter_map(|(path, branch)| {
+            let session = find_worktree_session(&path)?;
+            let worktree = WorktreeInfo {
+                path,
+                branch,
+                has_changes: false,
+                has_active_session: false,
+                orphaned_pids: Vec::new(),
+            };
+            Some(WorktreeSession { worktree, session })
+        })
+        .collect();
+    println!("{} ({} with sessions)", "done".green(), sessions.len());
+
+    if sessions.is_empty() {
+        println!("{} No worktrees with Claude sessions found", "→".blue().bold());
+        return Ok(());
+    }
+
+    // Sort by most recent session first
+    sessions.sort_by(|a, b| b.session.last_modified.cmp(&a.session.last_modified));
+
+    // Run the TUI and get the selected index
+    let selected = run_resume_tui(&sessions)?;
+
+    let Some(idx) = selected else {
+        return Ok(());
+    };
+
+    let ws = &sessions[idx];
+    let worktree_path = &ws.worktree.path;
+
+    // Set up iTerm colors and spawn claude --continue
+    let bg_color = pick_available_color(worktree_path);
+    save_worktree_color(worktree_path, &bg_color)?;
+
+    let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", ws.worktree.branch));
+
+    println!(
+        "\n{} Resuming session in {}...\n",
+        "→".blue().bold(),
+        worktree_path.display().to_string().cyan()
+    );
+
+    spawn_claude_continue(worktree_path)?;
+
+    Ok(())
+}
+
+/// Parse inline markdown (`**bold**`, `*italic*`, `` `code` ``) into styled spans.
+fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<(String, Style)> {
+    let mut segments: Vec<(String, Style)> = Vec::new();
+    let mut current = String::new();
+    let mut bold = false;
+    let mut italic = false;
+    let mut in_code = false;
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    let code_style = base_style.fg(Color::Cyan);
+
+    let make_style = |base: Style, b: bool, it: bool| -> Style {
+        let mut s = base;
+        if b { s = s.add_modifier(Modifier::BOLD); }
+        if it { s = s.add_modifier(Modifier::ITALIC); }
+        s
+    };
+
+    while i < len {
+        if chars[i] == '`' {
+            if !current.is_empty() {
+                let style = if in_code { code_style } else { make_style(base_style, bold, italic) };
+                segments.push((std::mem::take(&mut current), style));
+            }
+            in_code = !in_code;
+            i += 1;
+        } else if in_code {
+            // Inside backticks — no markdown parsing
+            current.push(chars[i]);
+            i += 1;
+        } else if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            if !current.is_empty() {
+                segments.push((std::mem::take(&mut current), make_style(base_style, bold, italic)));
+            }
+            bold = !bold;
+            i += 2;
+        } else if chars[i] == '*' {
+            if !current.is_empty() {
+                segments.push((std::mem::take(&mut current), make_style(base_style, bold, italic)));
+            }
+            italic = !italic;
+            i += 1;
+        } else {
+            current.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    if !current.is_empty() {
+        let style = if in_code { code_style } else { make_style(base_style, bold, italic) };
+        segments.push((current, style));
+    }
+
+    segments
+}
+
+/// Wrap pre-styled segments into display lines, breaking at word boundaries.
+fn wrap_styled_segments<'a>(segments: &[(String, Style)], width: usize) -> Vec<Vec<Span<'a>>> {
+    // Flatten into a list of (char, style) pairs
+    let mut styled_chars: Vec<(char, Style)> = Vec::new();
+    for (text, style) in segments {
+        for ch in text.chars() {
+            styled_chars.push((ch, *style));
+        }
+    }
+
+    if styled_chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result: Vec<Vec<Span<'a>>> = Vec::new();
+    let total = styled_chars.len();
+    let mut pos = 0;
+
+    while pos < total {
+        let line_end = (pos + width).min(total);
+
+        // If the whole remainder fits, take it all
+        if line_end == total {
+            let line = build_spans_from_styled_chars(&styled_chars[pos..total]);
+            result.push(line);
+            break;
+        }
+
+        // Look for a space to break at (scan backwards from the cut point)
+        let mut break_at = line_end;
+        let mut found_space = false;
+        for i in (pos..line_end).rev() {
+            if styled_chars[i].0 == ' ' {
+                break_at = i + 1; // break after the space
+                found_space = true;
+                break;
+            }
+        }
+
+        // If no space found, hard-break at width
+        if !found_space {
+            break_at = line_end;
+        }
+
+        let line = build_spans_from_styled_chars(&styled_chars[pos..break_at]);
+        result.push(line);
+        pos = break_at;
+    }
+
+    result
+}
+
+/// Convert a slice of (char, style) pairs into coalesced Spans.
+fn build_spans_from_styled_chars<'a>(chars: &[(char, Style)]) -> Vec<Span<'a>> {
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    if chars.is_empty() {
+        return spans;
+    }
+
+    let mut current_text = String::new();
+    let mut current_style = chars[0].1;
+
+    for &(ch, style) in chars {
+        if style == current_style {
+            current_text.push(ch);
+        } else {
+            if !current_text.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut current_text), current_style));
+            }
+            current_style = style;
+            current_text.push(ch);
+        }
+    }
+
+    if !current_text.is_empty() {
+        spans.push(Span::styled(current_text, current_style));
+    }
+
+    spans
+}
+
+/// Render messages for a session into display lines, fitting within a line budget.
+fn render_session_messages(ws: &WorktreeSession, max_lines: usize, msg_width: usize) -> Vec<Line<'static>> {
+    let prefix_width = 14; // "    ┃ Claude " = 14 chars
+    let effective_msg_width = if msg_width > prefix_width + 4 { msg_width - prefix_width } else { 40 };
+
+    let mut all_msg_lines: Vec<Vec<Line>> = Vec::new();
+
+    for (msg_idx, msg) in ws.session.messages.iter().enumerate() {
+        let (label, label_style, text_style) = if msg.role == "user" {
+            ("You   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+             Style::default().fg(Color::White))
+        } else {
+            ("Claude", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+             Style::default().fg(Color::Gray))
+        };
+
+        let mut msg_lines: Vec<Line> = Vec::new();
+
+        if msg_idx > 0 {
+            msg_lines.push(Line::from(vec![
+                Span::styled("    ┃", Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        let mut first_line = true;
+
+        for text_line in msg.content.split('\n') {
+            if text_line.is_empty() {
+                if first_line {
+                    msg_lines.push(Line::from(vec![
+                        Span::styled("    ┃ ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(label, label_style),
+                    ]));
+                    first_line = false;
+                } else {
+                    msg_lines.push(Line::from(vec![
+                        Span::styled("    ┃ ", Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+                continue;
+            }
+
+            let segments = parse_inline_markdown(text_line, text_style);
+            let wrapped = wrap_styled_segments(&segments, effective_msg_width);
+
+            for display_spans in wrapped {
+                let mut line_spans = vec![
+                    Span::styled("    ┃ ", Style::default().fg(Color::DarkGray)),
+                ];
+                if first_line {
+                    line_spans.push(Span::styled(label, label_style));
+                    line_spans.push(Span::raw(" "));
+                    first_line = false;
+                } else {
+                    line_spans.push(Span::raw("       "));
+                }
+                line_spans.extend(display_spans);
+                msg_lines.push(Line::from(line_spans));
+            }
+        }
+
+        all_msg_lines.push(msg_lines);
+    }
+
+    // Walk backwards from newest, fitting whole messages
+    let mut budget = max_lines;
+    let mut start_msg = all_msg_lines.len();
+
+    for (i, msg_lines) in all_msg_lines.iter().enumerate().rev() {
+        if msg_lines.len() <= budget {
+            budget -= msg_lines.len();
+            start_msg = i;
+        } else {
+            break;
+        }
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // If there's remaining budget and an older message that didn't fit whole,
+    // show its tail to fill the panel
+    if budget > 0 && start_msg > 0 {
+        let partial_idx = start_msg - 1;
+        let partial = &all_msg_lines[partial_idx];
+        let partial_msg = &ws.session.messages[partial_idx];
+
+        // Reserve 1 line for the "..." label
+        let tail_budget = budget.saturating_sub(1);
+        if tail_budget > 0 {
+            let (label, label_style) = if partial_msg.role == "user" {
+                ("You   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            } else {
+                ("Claude", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+            };
+            lines.push(Line::from(vec![
+                Span::styled("    ┃ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(label, label_style),
+                Span::styled(" ...", Style::default().fg(Color::DarkGray)),
+            ]));
+            let skip = partial.len().saturating_sub(tail_budget);
+            lines.extend(partial[skip..].iter().cloned());
+        }
+    }
+
+    if start_msg < all_msg_lines.len() {
+        for msg_lines in &all_msg_lines[start_msg..] {
+            lines.extend(msg_lines.iter().cloned());
+        }
+    } else if all_msg_lines.len() == 1 {
+        // Only one message and it's too large — show label + tail
+        let newest_lines = &all_msg_lines[0];
+        let newest_msg = &ws.session.messages[0];
+        let (label, label_style) = if newest_msg.role == "user" {
+            ("You   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else {
+            ("Claude", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        };
+        lines.push(Line::from(vec![
+            Span::styled("    ┃ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(label, label_style),
+            Span::styled(" ...", Style::default().fg(Color::DarkGray)),
+        ]));
+        let tail_budget = max_lines.saturating_sub(1);
+        let skip = newest_lines.len().saturating_sub(tail_budget);
+        lines.extend(newest_lines[skip..].iter().cloned());
+    }
+
+    lines
+}
+
+fn run_resume_tui(sessions: &[WorktreeSession]) -> Result<Option<usize>, String> {
+    enable_raw_mode().map_err(|e| format!("Failed to enable raw mode: {}", e))?;
+    let mut stdout = io::stdout();
+    stdout.execute(EnterAlternateScreen).map_err(|e| format!("Failed to enter alternate screen: {}", e))?;
+
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).map_err(|e| format!("Failed to create terminal: {}", e))?;
+
+    let mut selected: usize = 0;
+    let mut scroll_offset: usize = 0;
+    let visible_branches: usize = 10;
+    let scroll_margin: usize = 2;
+
+    let result = loop {
+        terminal.draw(|frame| {
+            let area = frame.area();
+
+            // Clamp visible branches to what fits
+            let branch_height = visible_branches.min(sessions.len()) as u16;
+
+            // Layout: title | messages | separator | branches | footer
+            let chunks = Layout::vertical([
+                Constraint::Length(2),           // title + blank
+                Constraint::Min(3),              // message panel (flexible)
+                Constraint::Length(1),            // separator
+                Constraint::Length(branch_height), // branch list
+                Constraint::Length(1),            // footer
+            ]).split(area);
+
+            let available_width = area.width as usize;
+
+            // -- Title --
+            let title = Paragraph::new(Line::from(vec![
+                Span::styled("checkout resume", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" — Select a worktree to resume", Style::default().fg(Color::DarkGray)),
+            ]));
+            frame.render_widget(title, chunks[0]);
+
+            // -- Message panel --
+            let msg_height = chunks[1].height as usize;
+            let msg_lines = render_session_messages(&sessions[selected], msg_height, available_width);
+            // Bottom-align: if fewer lines than panel height, pad from top
+            let mut padded: Vec<Line> = Vec::new();
+            if msg_lines.len() < msg_height {
+                for _ in 0..(msg_height - msg_lines.len()) {
+                    padded.push(Line::from(""));
+                }
+            }
+            padded.extend(msg_lines);
+            let msg_paragraph = Paragraph::new(padded);
+            frame.render_widget(msg_paragraph, chunks[1]);
+
+            // -- Separator --
+            let sep_line = "─".repeat(available_width);
+            let separator = Paragraph::new(Line::from(
+                Span::styled(sep_line, Style::default().fg(Color::DarkGray))
+            ));
+            frame.render_widget(separator, chunks[2]);
+
+            // -- Branch list --
+            let visible_count = branch_height as usize;
+            let end = (scroll_offset + visible_count).min(sessions.len());
+
+            let mut branch_lines: Vec<Line> = Vec::new();
+            for i in scroll_offset..end {
+                let ws = &sessions[i];
+                let is_sel = i == selected;
+
+                let dir_name = ws.worktree.path.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| ws.worktree.path.display().to_string());
+
+                let time_ago = format_time_ago(ws.session.last_modified);
+                let arrow = if is_sel { "▸ " } else { "  " };
+                let branch_part = format!("({})", ws.worktree.branch);
+
+                let left_len = arrow.chars().count() + dir_name.chars().count() + 1 + branch_part.chars().count();
+                let time_len = time_ago.chars().count();
+                let pad = if available_width > left_len + time_len {
+                    available_width - left_len - time_len
+                } else {
+                    1
+                };
+
+                let line_style = if is_sel {
+                    Style::default().bg(Color::Rgb(40, 40, 50))
+                } else {
+                    Style::default()
+                };
+
+                branch_lines.push(Line::from(vec![
+                    Span::styled(arrow, if is_sel { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD).bg(Color::Rgb(40, 40, 50)) } else { Style::default() }),
+                    Span::styled(dir_name, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD).patch(line_style)),
+                    Span::styled(" ", line_style),
+                    Span::styled(branch_part, Style::default().fg(Color::DarkGray).patch(line_style)),
+                    Span::styled(" ".repeat(pad), line_style),
+                    Span::styled(time_ago, Style::default().fg(Color::DarkGray).patch(line_style)),
+                ]));
+            }
+            let branch_paragraph = Paragraph::new(branch_lines);
+            frame.render_widget(branch_paragraph, chunks[3]);
+
+            // -- Footer --
+            let footer = Paragraph::new(Line::from(vec![
+                Span::styled("↑↓", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" Navigate  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" Resume  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("q", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(" Quit", Style::default().fg(Color::DarkGray)),
+            ]));
+            frame.render_widget(footer, chunks[4]);
+        }).map_err(|e| format!("Draw error: {}", e))?;
+
+        // Handle input
+        if event::poll(std::time::Duration::from_millis(100)).unwrap_or(false) {
+            if let Ok(Event::Key(key)) = event::read() {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break Ok(None),
+                    KeyCode::Enter => {
+                        break Ok(Some(selected));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if selected > 0 {
+                            selected -= 1;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if selected < sessions.len() - 1 {
+                            selected += 1;
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Adjust scroll offset to keep selection visible with margin
+                let vis = visible_branches.min(sessions.len());
+                if selected < scroll_offset + scroll_margin {
+                    scroll_offset = selected.saturating_sub(scroll_margin);
+                } else if selected + scroll_margin >= scroll_offset + vis {
+                    scroll_offset = (selected + scroll_margin + 1).saturating_sub(vis);
+                }
+                scroll_offset = scroll_offset.min(sessions.len().saturating_sub(vis));
+            }
+        }
+    };
+
+    // Restore terminal
+    disable_raw_mode().map_err(|e| format!("Failed to disable raw mode: {}", e))?;
+    terminal.backend_mut().execute(LeaveAlternateScreen).map_err(|e| format!("Failed to leave alternate screen: {}", e))?;
+    terminal.show_cursor().map_err(|e| format!("Failed to show cursor: {}", e))?;
+
+    result
 }
