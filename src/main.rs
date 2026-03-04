@@ -374,8 +374,6 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
         return Err(format!("Repo not found at {}", repo_root.display()));
     }
 
-    let sparse_paths = load_sparse_config(&repo_root);
-
     print!("{} Fetching PR details... ", "→".blue().bold());
     std::io::stdout().flush().ok();
     let pr_details = fetch_pr_details(pr_number, &repo_root)?;
@@ -433,13 +431,13 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
             }
             ExistingWorktreeAction::CreateNew => {
                 let new_path = find_next_worktree_path(&worktree_dir, &format!("pr-{}-{}", pr_number, slug))?;
-                create_new_worktree_from_remote(&repo_root, &worktree_dir, &new_path, &pr_details.head_ref_name, sparse_paths.as_deref())?;
+                create_new_worktree_from_remote(&repo_root, &worktree_dir, &new_path, &pr_details.head_ref_name)?;
                 is_new_worktree = true;
                 new_path
             }
         }
     } else {
-        create_new_worktree_from_remote(&repo_root, &worktree_dir, &worktree_path, &pr_details.head_ref_name, sparse_paths.as_deref())?;
+        create_new_worktree_from_remote(&repo_root, &worktree_dir, &worktree_path, &pr_details.head_ref_name)?;
         is_new_worktree = true;
         worktree_path
     };
@@ -472,7 +470,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
         let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", pr_details.head_ref_name));
 
-        let system_prompt = build_worktree_system_prompt(sparse_paths.as_deref());
+        let system_prompt = build_worktree_system_prompt();
 
         if resume {
             println!();
@@ -517,8 +515,6 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
         return Err(format!("Repo not found at {}", repo_root.display()));
     }
 
-    let sparse_paths = load_sparse_config(&repo_root);
-
     // Create slug from branch name (strip any prefix like darren/ for the directory name)
     let slug = branch_name.rsplit('/').next().unwrap_or(&branch_name);
     let worktree_dir = default_worktree_dir();
@@ -558,13 +554,13 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
             }
             ExistingWorktreeAction::CreateNew => {
                 let new_path = find_next_worktree_path(&worktree_dir, &format!("branch-{}", slug))?;
-                create_new_worktree_new_branch(&repo_root, &worktree_dir, &new_path, &branch_name, sparse_paths.as_deref())?;
+                create_new_worktree_new_branch(&repo_root, &worktree_dir, &new_path, &branch_name)?;
                 is_new_worktree = true;
                 new_path
             }
         }
     } else {
-        create_new_worktree_new_branch(&repo_root, &worktree_dir, &worktree_path, &branch_name, sparse_paths.as_deref())?;
+        create_new_worktree_new_branch(&repo_root, &worktree_dir, &worktree_path, &branch_name)?;
         is_new_worktree = true;
         worktree_path
     };
@@ -597,7 +593,7 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
         let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
 
-        let system_prompt = build_worktree_system_prompt(sparse_paths.as_deref());
+        let system_prompt = build_worktree_system_prompt();
 
         if resume {
             println!();
@@ -1046,7 +1042,6 @@ fn create_new_worktree_from_remote(
     worktree_dir: &PathBuf,
     worktree_path: &PathBuf,
     branch: &str,
-    sparse_paths: Option<&[String]>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(worktree_dir)
         .map_err(|e| format!("Failed to create worktrees dir: {}", e))?;
@@ -1066,19 +1061,8 @@ fn create_new_worktree_from_remote(
         worktree_path.display().to_string().cyan()
     );
     std::io::stdout().flush().ok();
-    create_worktree_from_ref(repo_root, worktree_path, &format!("origin/{}", branch), sparse_paths.is_some())?;
+    create_worktree_from_ref(repo_root, worktree_path, &format!("origin/{}", branch))?;
     println!("{}", "done".green());
-
-    if let Some(paths) = sparse_paths {
-        print!(
-            "{} Setting up sparse checkout ({} folders)... ",
-            "→".blue().bold(),
-            paths.len().to_string().cyan()
-        );
-        std::io::stdout().flush().ok();
-        init_sparse_checkout(worktree_path, paths)?;
-        print_sparse_checkout_summary(worktree_path, paths);
-    }
 
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
@@ -1100,7 +1084,6 @@ fn create_new_worktree_new_branch(
     worktree_dir: &PathBuf,
     worktree_path: &PathBuf,
     branch: &str,
-    sparse_paths: Option<&[String]>,
 ) -> Result<(), String> {
     std::fs::create_dir_all(worktree_dir)
         .map_err(|e| format!("Failed to create worktrees dir: {}", e))?;
@@ -1117,19 +1100,8 @@ fn create_new_worktree_new_branch(
         branch.yellow()
     );
     std::io::stdout().flush().ok();
-    create_worktree_new_branch(repo_root, worktree_path, branch, sparse_paths.is_some())?;
+    create_worktree_new_branch(repo_root, worktree_path, branch)?;
     println!("{}", "done".green());
-
-    if let Some(paths) = sparse_paths {
-        print!(
-            "{} Setting up sparse checkout ({} folders)... ",
-            "→".blue().bold(),
-            paths.len().to_string().cyan()
-        );
-        std::io::stdout().flush().ok();
-        init_sparse_checkout(worktree_path, paths)?;
-        print_sparse_checkout_summary(worktree_path, paths);
-    }
 
     // Track with graphite
     print!("{} Tracking with Graphite... ", "→".blue().bold());
@@ -1345,14 +1317,11 @@ fn fetch_branch(repo_root: &PathBuf, branch: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_ref: &str, no_checkout: bool) -> Result<(), String> {
+fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_ref: &str) -> Result<(), String> {
     let repo_str = repo_root.to_string_lossy();
     let wt_str = worktree_path.to_string_lossy();
 
     let mut args: Vec<&str> = vec!["-C", &repo_str, "worktree", "add"];
-    if no_checkout {
-        args.push("--no-checkout");
-    }
     args.push(&wt_str);
     args.push(git_ref);
 
@@ -1366,9 +1335,6 @@ fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_re
     if !status.success() {
         // Try with FETCH_HEAD if branch is checked out elsewhere
         let mut args: Vec<&str> = vec!["-C", &repo_str, "worktree", "add"];
-        if no_checkout {
-            args.push("--no-checkout");
-        }
         args.push(&wt_str);
         args.push("FETCH_HEAD");
 
@@ -1387,14 +1353,11 @@ fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_re
     Ok(())
 }
 
-fn create_worktree_new_branch(repo_root: &PathBuf, worktree_path: &PathBuf, branch: &str, no_checkout: bool) -> Result<(), String> {
+fn create_worktree_new_branch(repo_root: &PathBuf, worktree_path: &PathBuf, branch: &str) -> Result<(), String> {
     let repo_str = repo_root.to_string_lossy();
     let wt_str = worktree_path.to_string_lossy();
 
     let mut args: Vec<&str> = vec!["-C", &repo_str, "worktree", "add"];
-    if no_checkout {
-        args.push("--no-checkout");
-    }
     args.extend_from_slice(&["-b", branch, &wt_str, "origin/master"]);
 
     let status = Command::new("git")
@@ -1407,9 +1370,6 @@ fn create_worktree_new_branch(repo_root: &PathBuf, worktree_path: &PathBuf, bran
     if !status.success() {
         // Branch may already exist from a previous attempt — try checking it out directly
         let mut args: Vec<&str> = vec!["-C", &repo_str, "worktree", "add"];
-        if no_checkout {
-            args.push("--no-checkout");
-        }
         args.extend_from_slice(&[&wt_str, branch]);
 
         let status = Command::new("git")
@@ -1667,197 +1627,13 @@ fn add_claude_trust(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), 
     Ok(())
 }
 
-fn load_sparse_config(repo_root: &Path) -> Option<Vec<String>> {
-    let home = env::var("HOME").ok()?;
-    let config_path = PathBuf::from(format!(
-        "{}/.local/share/checkout/sparse-checkout.json",
-        home
-    ));
-    let content = fs::read_to_string(&config_path).ok()?;
-    let data: Value = serde_json::from_str(&content).ok()?;
-    let repo_key = repo_root.to_string_lossy();
-    let entry = data.get(repo_key.as_ref())?;
-    let paths = entry.get("paths")?.as_array()?;
-    let result: Vec<String> = paths
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
-    }
-}
-
-fn init_sparse_checkout(worktree_path: &Path, paths: &[String]) -> Result<(), String> {
-    let wt_str = worktree_path.to_string_lossy();
-
-    let status = Command::new("git")
-        .args(["-C", &wt_str, "sparse-checkout", "init", "--cone"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to init sparse-checkout: {}", e))?;
-
-    if !status.success() {
-        return Err("git sparse-checkout init --cone failed".to_string());
-    }
-
-    let mut args: Vec<&str> = vec!["-C", &wt_str, "sparse-checkout", "set"];
-    for p in paths {
-        args.push(p.as_str());
-    }
-
-    let status = Command::new("git")
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to set sparse-checkout paths: {}", e))?;
-
-    if !status.success() {
-        return Err("git sparse-checkout set failed".to_string());
-    }
-
-    let status = Command::new("git")
-        .args(["-C", &wt_str, "checkout"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to checkout: {}", e))?;
-
-    if !status.success() {
-        return Err("git checkout failed after sparse-checkout setup".to_string());
-    }
-
-    Ok(())
-}
-
-/// Count all files in HEAD (ignores sparse-checkout state).
-fn count_tree_files(repo_path: &Path) -> Result<u64, String> {
-    let output = Command::new("git")
-        .args(["-C", &repo_path.to_string_lossy(), "ls-tree", "-r", "--name-only", "HEAD"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to count tree files: {}", e))?;
-
-    let count = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .count() as u64;
-    Ok(count)
-}
-
-/// Count files actually checked out on disk (excludes skip-worktree entries
-/// from sparse checkout). Uses `git ls-files -t` and counts only `H` (tracked) lines.
-fn count_checked_out_files(repo_path: &Path) -> Result<u64, String> {
-    let output = Command::new("git")
-        .args(["-C", &repo_path.to_string_lossy(), "ls-files", "-t"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to count checked-out files: {}", e))?;
-
-    let count = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| line.starts_with("H "))
-        .count() as u64;
-    Ok(count)
-}
-
-/// Count files under a specific folder in git ls-files -t output.
-fn count_folder_files(repo_path: &Path, folder: &str) -> Result<u64, String> {
-    let output = Command::new("git")
-        .args(["-C", &repo_path.to_string_lossy(), "ls-files", "-t", "--", &format!("{}/", folder)])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to count folder files: {}", e))?;
-
-    let count = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| line.starts_with("H "))
-        .count() as u64;
-    Ok(count)
-}
-
-fn print_sparse_checkout_summary(worktree_path: &Path, paths: &[String]) {
-    let total = count_tree_files(worktree_path).unwrap_or(0);
-    let checked_out = count_checked_out_files(worktree_path).unwrap_or(0);
-    let pct_saved = if total > 0 && total > checked_out {
-        ((total - checked_out) as f64 / total as f64 * 100.0) as u64
-    } else {
-        0
-    };
-    println!(
-        "{} ({}/{} files, {}% fewer)",
-        "done".green(),
-        checked_out.to_string().cyan(),
-        total.to_string().dimmed(),
-        pct_saved.to_string().green().bold()
-    );
-
-    // Per-folder breakdown sorted by file count descending
-    let mut folder_counts: Vec<(&str, u64)> = paths
-        .iter()
-        .filter_map(|p| {
-            count_folder_files(worktree_path, p).ok().map(|c| (p.as_str(), c))
-        })
-        .collect();
-    folder_counts.sort_by(|a, b| b.1.cmp(&a.1));
-
-    // Count root-level files (not under any sparse folder)
-    let folder_total: u64 = folder_counts.iter().map(|(_, c)| *c).sum();
-    let root_files = checked_out.saturating_sub(folder_total);
-
-    for (folder, count) in &folder_counts {
-        let pct = if checked_out > 0 {
-            (*count as f64 / checked_out as f64 * 100.0) as u64
-        } else {
-            0
-        };
-        println!(
-            "  {:>6} files  {:>3}%  {}",
-            count.to_string().cyan(),
-            pct.to_string().dimmed(),
-            folder.dimmed()
-        );
-    }
-    if root_files > 0 {
-        let pct = if checked_out > 0 {
-            (root_files as f64 / checked_out as f64 * 100.0) as u64
-        } else {
-            0
-        };
-        println!(
-            "  {:>6} files  {:>3}%  {}",
-            root_files.to_string().cyan(),
-            pct.to_string().dimmed(),
-            "(root)".dimmed()
-        );
-    }
-}
-
-fn build_worktree_system_prompt(sparse_paths: Option<&[String]>) -> String {
-    let mut parts = vec![
-        "IMPORTANT: This is a git worktree. The node_modules directories are symlinked \
-         from the main repo. NEVER run `pnpm install` in this worktree — it will corrupt \
-         the shared node_modules symlinks with absolute paths pointing at this worktree, \
-         breaking the main repo and all other worktrees. If you need to test dependency \
-         changes, first `rm` the node_modules symlink to create an isolated copy."
-            .to_string(),
-    ];
-
-    if let Some(paths) = sparse_paths {
-        parts.push(format!(
-            "This worktree uses sparse checkout. Only these folders are checked out: {}\n\
-             To check out additional folders, run: git sparse-checkout add <folder>\n\
-             To disable sparse checkout entirely, run: git sparse-checkout disable",
-            paths.join(", ")
-        ));
-    }
-
-    parts.join("\n\n")
+fn build_worktree_system_prompt() -> String {
+    "IMPORTANT: This is a git worktree. The node_modules directories are symlinked \
+     from the main repo. NEVER run `pnpm install` in this worktree — it will corrupt \
+     the shared node_modules symlinks with absolute paths pointing at this worktree, \
+     breaking the main repo and all other worktrees. If you need to test dependency \
+     changes, first `rm` the node_modules symlink to create an isolated copy."
+        .to_string()
 }
 
 fn spawn_claude_with_prompt(worktree_path: &PathBuf, prompt: &str, append_system_prompt: Option<&str>) -> Result<(), String> {
