@@ -19,6 +19,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::SystemTime;
 
 /// Color palette - subtle dark backgrounds with pastel hues
@@ -333,6 +334,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
     let existing = find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?;
 
     let mut resume = false;
+    let mut is_new_worktree = false;
 
     let final_path = if let Some(existing_path) = existing {
         println!(
@@ -367,12 +369,20 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
             ExistingWorktreeAction::CreateNew => {
                 let new_path = find_next_worktree_path(&worktree_dir, &format!("pr-{}-{}", pr_number, slug))?;
                 create_new_worktree_from_remote(&repo_root, &worktree_dir, &new_path, &pr_details.head_ref_name)?;
+                is_new_worktree = true;
                 new_path
             }
         }
     } else {
         create_new_worktree_from_remote(&repo_root, &worktree_dir, &worktree_path, &pr_details.head_ref_name)?;
+        is_new_worktree = true;
         worktree_path
+    };
+
+    let bg_handle = if is_new_worktree {
+        Some(spawn_background_setup(final_path.clone(), repo_root.clone()))
+    } else {
+        None
     };
 
     println!();
@@ -418,6 +428,10 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
         }
     }
 
+    if let Some(handle) = bg_handle {
+        let _ = handle.join();
+    }
+
     Ok(())
 }
 
@@ -445,6 +459,7 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
     let existing = find_existing_worktree(&repo_root, &format!("branch-{}", slug))?;
 
     let mut resume = false;
+    let mut is_new_worktree = false;
 
     let final_path = if let Some(existing_path) = existing {
         println!(
@@ -475,12 +490,20 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
             ExistingWorktreeAction::CreateNew => {
                 let new_path = find_next_worktree_path(&worktree_dir, &format!("branch-{}", slug))?;
                 create_new_worktree_new_branch(&repo_root, &worktree_dir, &new_path, &branch_name)?;
+                is_new_worktree = true;
                 new_path
             }
         }
     } else {
         create_new_worktree_new_branch(&repo_root, &worktree_dir, &worktree_path, &branch_name)?;
+        is_new_worktree = true;
         worktree_path
+    };
+
+    let bg_handle = if is_new_worktree {
+        Some(spawn_background_setup(final_path.clone(), repo_root.clone()))
+    } else {
+        None
     };
 
     println!();
@@ -535,6 +558,10 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
                 spawn_claude(&final_path)?;
             }
         }
+    }
+
+    if let Some(handle) = bg_handle {
+        let _ = handle.join();
     }
 
     Ok(())
@@ -1008,6 +1035,26 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Spawn non-critical worktree setup steps in the background so Claude can
+/// start sooner. Runs `mise trust` (if available) and `symlink_node_modules`.
+/// Errors are logged to stderr but otherwise ignored.
+fn spawn_background_setup(
+    worktree_path: PathBuf,
+    repo_root: PathBuf,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        if which_mise().is_some() {
+            if let Err(e) = run_mise_trust(&worktree_path) {
+                eprintln!("background: mise trust failed: {}", e);
+            }
+        }
+
+        if let Err(e) = symlink_node_modules(&worktree_path, &repo_root) {
+            eprintln!("background: symlink_node_modules failed: {}", e);
+        }
+    })
+}
+
 fn create_new_worktree_from_remote(
     repo_root: &PathBuf,
     worktree_dir: &PathBuf,
@@ -1034,23 +1081,6 @@ fn create_new_worktree_from_remote(
     std::io::stdout().flush().ok();
     create_worktree_from_ref(repo_root, worktree_path, &format!("origin/{}", branch))?;
     println!("{}", "done".green());
-
-    if which_mise().is_some() {
-        print!("{} Running mise trust... ", "→".blue().bold());
-        std::io::stdout().flush().ok();
-        run_mise_trust(worktree_path)?;
-        println!("{}", "done".green());
-    }
-
-    // Symlink node_modules from the main repo
-    print!("{} Linking node_modules... ", "→".blue().bold());
-    std::io::stdout().flush().ok();
-    let linked = symlink_node_modules(worktree_path, repo_root)?;
-    if linked == 0 {
-        println!("{}", "skipped (none found)".dimmed());
-    } else {
-        println!("{} ({} linked)", "done".green(), linked);
-    }
 
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
@@ -1091,28 +1121,11 @@ fn create_new_worktree_new_branch(
     create_worktree_new_branch(repo_root, worktree_path, branch)?;
     println!("{}", "done".green());
 
-    if which_mise().is_some() {
-        print!("{} Running mise trust... ", "→".blue().bold());
-        std::io::stdout().flush().ok();
-        run_mise_trust(worktree_path)?;
-        println!("{}", "done".green());
-    }
-
     // Track with graphite
     print!("{} Tracking with Graphite... ", "→".blue().bold());
     std::io::stdout().flush().ok();
     run_gt_track(worktree_path)?;
     println!("{}", "done".green());
-
-    // Symlink node_modules from the main repo
-    print!("{} Linking node_modules... ", "→".blue().bold());
-    std::io::stdout().flush().ok();
-    let linked = symlink_node_modules(worktree_path, repo_root)?;
-    if linked == 0 {
-        println!("{}", "skipped (none found)".dimmed());
-    } else {
-        println!("{} ({} linked)", "done".green(), linked);
-    }
 
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
