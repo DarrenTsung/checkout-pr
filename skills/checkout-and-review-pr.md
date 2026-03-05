@@ -179,7 +179,39 @@ Spawn a teammate with this prompt:
 >
 > Output each finding with the file path relative to the working directory with line number (e.g., src/file.ts:123), what the issue is, and why it matters. If the PR is coherent, output "PR implementation is coherent with its stated goals."
 
-### Teammate 7: Multiplayer Reviewer (only if multiplayer PR)
+### Teammate 7: Risk Reviewer
+
+Spawn a teammate with this prompt:
+
+> Review this PR for hidden risks and questionable assumptions. Don't look for bugs — look for things that could go wrong in production even if the code is technically correct.
+>
+> **Question the assumptions:**
+> - What invariants does this code rely on? Are they documented or enforced?
+> - What happens if the input data doesn't match expected patterns (unexpected nulls, empty collections, malformed strings)?
+> - Are there implicit ordering dependencies (e.g., "X must happen before Y") that aren't enforced?
+> - Does this code assume single-threaded execution, low latency, or bounded data sizes?
+>
+> **Look for failure modes:**
+> - What happens under concurrent access or high load?
+> - What's the failure mode if an external dependency (database, API, service) is slow or unavailable?
+> - Are there race conditions between multiple readers/writers?
+> - Can partial failures leave the system in an inconsistent state?
+> - What happens if this code is called with unexpected frequency (e.g., thundering herd, retry storms)?
+>
+> **Assess blast radius:**
+> - If this change breaks, what's affected? Just this feature, or does it cascade?
+> - Is there a rollback path? Feature flag? Can this be safely reverted?
+> - Does this change affect data persistence? Could bad data be written that's hard to clean up?
+>
+> Do NOT flag:
+> - Theoretical risks that require extremely unlikely conditions
+> - Risks already mitigated by existing error handling visible in the diff
+> - Generic concerns without specific connection to code in this PR
+> - Pre-existing risks not introduced or worsened by this PR
+>
+> Output each risk with the file path relative to the working directory with line number (e.g., src/file.ts:123), the assumption being made, and what could go wrong if it's violated. If no significant risks, output "No hidden risks identified."
+
+### Teammate 8: Multiplayer Reviewer (only if multiplayer PR)
 
 **Only spawn this teammate if the PR touches multiplayer code.**
 
@@ -236,8 +268,11 @@ Wait for all teammates to complete their reviews. Then synthesize their findings
 ### Coherence
 [Teammate 6 findings]
 
-### Multiplayer (if applicable)
+### Risks
 [Teammate 7 findings]
+
+### Multiplayer (if applicable)
+[Teammate 8 findings]
 
 ---
 
