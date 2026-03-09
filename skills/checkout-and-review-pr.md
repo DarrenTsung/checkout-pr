@@ -14,6 +14,7 @@ Checkout and review PR $ARGUMENTS using the gh CLI tool.
 1. First, fetch the PR details:
    - Run `gh pr view <PR_NUMBER> --json title,body,files,additions,deletions,author,baseRefName,headRefName,state,mergeable,reviewDecision`
    - Run `gh pr diff <PR_NUMBER>` to get the full diff
+   - Run `gh pr view <PR_NUMBER> --comments` to get all PR comments (the author's comments often explain known issues, trade-offs, or intentional decisions)
 
 2. Summarize the PR:
    - Title and author
@@ -30,7 +31,7 @@ Check if this PR touches multiplayer code:
 git diff $(git merge-base HEAD main)..HEAD --name-only | grep -E "(multiplayer|mp_)" || echo "NOT_MULTIPLAYER"
 ```
 
-Create an agent team to review this PR from multiple angles. Use Opus for all teammates. Spawn the following teammates:
+Create an agent team to review this PR from multiple angles. Use Opus for all teammates. **Include the PR comments in each teammate's prompt** — the author's comments provide important context about known issues, intentional trade-offs, and planned follow-ups that reviewers should not re-flag. Spawn the following teammates:
 
 ### Teammate 1: Correctness Reviewer
 
