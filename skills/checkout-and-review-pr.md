@@ -339,16 +339,7 @@ Wait for all teammates to complete their reviews. Then synthesize their findings
 
 ---
 
-**IMPORTANT:** Consolidate findings across teammates. When multiple reviewers flag the same issue (or overlapping aspects of it), merge into a single finding and tag it with all relevant categories. Format each finding as:
-
-> **description** [file.go:123] [tag1, tag2, ...]
-> Explanation of the issue and suggested fix.
-
-For example:
-> **`context.Background()` inside `Bootstrap()` removes all timeout/cancellation** [bootstrap.go:147] [go-style, risk]
-> `Bootstrap` runs with no timeout — a hung git clone blocks indefinitely while holding `bs.mu`, serializing all subsequent bootstrap calls for that workspace. Consider `context.WithTimeout` with a configurable upper bound instead of bare `context.Background()`.
-
-Tags to use: `correctness`, `test-coverage`, `test-readability`, `test-timing`, `test-value`, `coherence`, `risk`, `multiplayer`, `go-style`
+**IMPORTANT:** Only report unique issues. If multiple teammates flag the same issue, consolidate into one finding.
 
 ---
 
