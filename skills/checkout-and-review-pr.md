@@ -31,7 +31,7 @@ Check if this PR touches multiplayer code:
 git diff $(git merge-base HEAD main)..HEAD --name-only | grep -E "(multiplayer|mp_)" || echo "NOT_MULTIPLAYER"
 ```
 
-Create an agent team to review this PR from multiple angles. Use Opus for all teammates. **Include the PR comments in each teammate's prompt** — the author's comments provide important context about known issues, intentional trade-offs, and planned follow-ups that reviewers should not re-flag. Spawn the following teammates:
+Create an agent team to review this PR from multiple angles. Use Opus for all teammates. Spawn the following teammates:
 
 ### Teammate 1: Correctness Reviewer
 
@@ -245,7 +245,9 @@ Spawn a teammate with this prompt:
 
 ## Phase 3: Aggregate and Present Results
 
-Wait for all teammates to complete their reviews. Then synthesize their findings into a single review:
+Wait for all teammates to complete their reviews. Then synthesize their findings into a single review.
+
+**Cross-reference with PR comments:** Before presenting each finding, check if it was already acknowledged or discussed in the PR comments you fetched in Phase 1. If the author or a reviewer already called out the issue, note that it's a known concern with a brief reference (e.g., "Acknowledged by author in PR comments — decided to defer to follow-up"). Still include the finding, but mark it so the user can skip over known items.
 
 ---
 
