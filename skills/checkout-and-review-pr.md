@@ -26,9 +26,10 @@ Checkout and review PR $ARGUMENTS using the gh CLI tool.
 
 ## Phase 2: Full Code Review
 
-Check if this PR touches multiplayer code:
+Check if this PR touches multiplayer or Go code:
 ```bash
 git diff $(git merge-base HEAD main)..HEAD --name-only | grep -E "(multiplayer|mp_)" || echo "NOT_MULTIPLAYER"
+git diff $(git merge-base HEAD main)..HEAD --name-only | grep '\.go$' || echo "NOT_GO"
 ```
 
 Create an agent team to review this PR from multiple angles. Use Opus for all teammates. Spawn the following teammates:
@@ -241,6 +242,62 @@ Spawn a teammate with this prompt:
 >
 > Output any issues found with file paths relative to the working directory and line numbers (e.g., src/protocol.ts:45 and multiplayer/src/protocol.rs:78). If no issues, output "No multiplayer-specific issues found."
 
+### Teammate 9: Go Style Reviewer (only if Go PR)
+
+**Only spawn this teammate if the PR touches `.go` files.**
+
+Spawn a teammate with this prompt:
+
+> Review this PR's Go code against our style guide. Focus on patterns that affect correctness, maintainability, and API design — not cosmetic issues that `gofmt` handles.
+>
+> **Error handling:**
+> - Handle OR return errors, never both (no `log.Error(err); return err` double-handling)
+> - Return an error OR a usable value, not both (no `return partialResult, err`)
+> - Errors should be wrapped with context: `fmt.Errorf("fetching user: %w", err)`
+> - Never `panic` in library code; never `recover`
+> - At error origin, add stack trace with `xerrors.WithStack(err)`
+>
+> **Context usage:**
+> - `ctx context.Context` must be the first parameter, named `ctx`
+> - Pass context through, don't store it in structs
+> - Context values only for request-scoped cross-cutting concerns (logging, tracing) — never for controlling behavior
+>
+> **Types and APIs:**
+> - Use type definitions for domain concepts (e.g., `type UserID uint64`) instead of bare primitives
+> - Prefer generics over `interface{}` / `any` for type-safe APIs
+> - Interfaces should be narrow (1-3 methods); define where used, not where implemented
+> - Use options pattern (`func WithTimeout(d time.Duration) ClientOption`) for extensible config
+> - Return concrete types, accept interfaces
+>
+> **Dependencies and construction:**
+> - Take dependencies as interface arguments (dependency injection), not global singletons
+> - Parse env/flags only in `main()` — pass explicit config structs to components
+> - Never check `if production` — use explicit config
+> - Prefer standard library, then minimal well-known deps, then frameworks
+>
+> **Concurrency:**
+> - Prefer NOT spawning goroutines — let callers decide
+> - Always know when goroutines will exit; use `xsync.Group` for background tasks
+> - Be judicious with channels — often a mutex is simpler
+>
+> **Conditionals and style:**
+> - Use `len(x) > 0` not `x != nil` for "has items" checks on slices/maps
+> - Don't check nil before `len()` — `len(nil) == 0` is safe
+> - Use early returns to flatten nested conditionals
+> - Never use bare returns in named return functions
+> - Use pointer receivers consistently (don't mix value and pointer receivers)
+>
+> **Testing:**
+> - Use standard `testing` package (exception: `testify/require` for assertions)
+> - Prefer fakes (in-memory implementations) over mock frameworks
+>
+> Do NOT flag:
+> - Issues already caught by `gofmt`, `go vet`, or standard linters
+> - Pre-existing style violations not introduced by this PR
+> - Minor naming preferences that don't affect clarity
+>
+> Output each finding with the file path relative to the working directory with line number (e.g., go/common/metrics/client.go:45), the pattern violated, and a brief fix suggestion. If no issues, output "Go code follows style guide."
+
 ---
 
 ## Phase 3: Aggregate and Present Results
@@ -277,9 +334,21 @@ Wait for all teammates to complete their reviews. Then synthesize their findings
 ### Multiplayer (if applicable)
 [Teammate 8 findings]
 
+### Go Style (if applicable)
+[Teammate 9 findings]
+
 ---
 
-**IMPORTANT:** Only report unique issues. If multiple teammates flag the same issue, consolidate into one finding.
+**IMPORTANT:** Consolidate findings across teammates. When multiple reviewers flag the same issue (or overlapping aspects of it), merge into a single finding and tag it with all relevant categories. Format each finding as:
+
+> **description** [file.go:123] [tag1, tag2, ...]
+> Explanation of the issue and suggested fix.
+
+For example:
+> **`context.Background()` inside `Bootstrap()` removes all timeout/cancellation** [bootstrap.go:147] [go-style, risk]
+> `Bootstrap` runs with no timeout — a hung git clone blocks indefinitely while holding `bs.mu`, serializing all subsequent bootstrap calls for that workspace. Consider `context.WithTimeout` with a configurable upper bound instead of bare `context.Background()`.
+
+Tags to use: `correctness`, `test-coverage`, `test-readability`, `test-timing`, `test-value`, `coherence`, `risk`, `multiplayer`, `go-style`
 
 ---
 
