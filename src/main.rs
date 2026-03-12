@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Color palette - subtle dark backgrounds with pastel hues
 const COLOR_PALETTE: &[&str] = &[
@@ -431,13 +431,13 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
             }
             ExistingWorktreeAction::CreateNew => {
                 let new_path = find_next_worktree_path(&worktree_dir, &format!("pr-{}-{}", pr_number, slug))?;
-                create_new_worktree_from_remote(&repo_root, &worktree_dir, &new_path, &pr_details.head_ref_name)?;
+                create_new_worktree_from_remote(&repo_root, &worktree_dir, &new_path, &pr_details.head_ref_name, pr_number)?;
                 is_new_worktree = true;
                 new_path
             }
         }
     } else {
-        create_new_worktree_from_remote(&repo_root, &worktree_dir, &worktree_path, &pr_details.head_ref_name)?;
+        create_new_worktree_from_remote(&repo_root, &worktree_dir, &worktree_path, &pr_details.head_ref_name, pr_number)?;
         is_new_worktree = true;
         worktree_path
     };
@@ -1042,6 +1042,7 @@ fn create_new_worktree_from_remote(
     worktree_dir: &PathBuf,
     worktree_path: &PathBuf,
     branch: &str,
+    pr_number: u64,
 ) -> Result<(), String> {
     std::fs::create_dir_all(worktree_dir)
         .map_err(|e| format!("Failed to create worktrees dir: {}", e))?;
@@ -1052,17 +1053,24 @@ fn create_new_worktree_from_remote(
         branch.yellow()
     );
     std::io::stdout().flush().ok();
-    fetch_branch(repo_root, branch)?;
+    if fetch_branch(repo_root, branch).is_err() {
+        // Branch may have been deleted after merge — fetch the PR head ref instead
+        let pr_ref = format!("pull/{}/head", pr_number);
+        fetch_branch(repo_root, &pr_ref)?;
+    }
     println!("{}", "done".green());
 
-    print!(
-        "{} Creating worktree at {}... ",
+    println!(
+        "{} Creating worktree at {}",
         "→".blue().bold(),
         worktree_path.display().to_string().cyan()
     );
-    std::io::stdout().flush().ok();
     create_worktree_from_ref(repo_root, worktree_path, &format!("origin/{}", branch))?;
-    println!("{}", "done".green());
+    if let Some(count) = count_worktree_files(worktree_path) {
+        println!("  {} ({} files)", "done".green(), count.to_string().yellow());
+    } else {
+        println!("  {}", "done".green());
+    }
 
     // Copy claude settings
     print!("{} Copying claude settings... ", "→".blue().bold());
@@ -1094,14 +1102,17 @@ fn create_new_worktree_new_branch(
     fetch_branch(repo_root, "master")?;
     println!("{}", "done".green());
 
-    print!(
-        "{} Creating worktree with new branch {}... ",
+    println!(
+        "{} Creating worktree with new branch {}",
         "→".blue().bold(),
         branch.yellow()
     );
-    std::io::stdout().flush().ok();
     create_worktree_new_branch(repo_root, worktree_path, branch)?;
-    println!("{}", "done".green());
+    if let Some(count) = count_worktree_files(worktree_path) {
+        println!("  {} ({} files)", "done".green(), count.to_string().yellow());
+    } else {
+        println!("  {}", "done".green());
+    }
 
     // Track with graphite
     print!("{} Tracking with Graphite... ", "→".blue().bold());
@@ -1302,6 +1313,58 @@ fn find_existing_worktree(repo_root: &PathBuf, pattern: &str) -> Result<Option<P
     Ok(None)
 }
 
+/// Count files in a directory (non-recursively counts all entries via `git ls-files`)
+fn count_worktree_files(worktree_path: &PathBuf) -> Option<usize> {
+    let output = Command::new("git")
+        .args(["-C", &worktree_path.to_string_lossy(), "ls-files"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let count = output.stdout.iter().filter(|&&b| b == b'\n').count();
+        Some(count)
+    } else {
+        None
+    }
+}
+
+/// Run a git command with a spinner showing elapsed time.
+/// `label` is the prefix already printed (e.g. "→ Creating worktree...").
+/// Returns the command's exit status.
+fn run_git_with_spinner(args: &[&str]) -> Result<std::process::ExitStatus, String> {
+    let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let handle = thread::spawn(move || {
+        Command::new("git")
+            .args(&args_owned)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    });
+
+    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let start = Instant::now();
+    let mut i = 0;
+
+    while !handle.is_finished() {
+        let elapsed = start.elapsed().as_secs();
+        let spinner = spinner_chars[i % spinner_chars.len()];
+        print!("\r\x1b[K  {} {}s", spinner, elapsed);
+        std::io::stdout().flush().ok();
+        i += 1;
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Clear the spinner line
+    print!("\r\x1b[K");
+    std::io::stdout().flush().ok();
+
+    handle
+        .join()
+        .map_err(|_| "git command thread panicked".to_string())?
+        .map_err(|e| format!("Failed to run git command: {}", e))
+}
+
 fn fetch_branch(repo_root: &PathBuf, branch: &str) -> Result<(), String> {
     let status = Command::new("git")
         .args(["-C", &repo_root.to_string_lossy(), "fetch", "origin", branch])
@@ -1318,32 +1381,14 @@ fn fetch_branch(repo_root: &PathBuf, branch: &str) -> Result<(), String> {
 }
 
 fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_ref: &str) -> Result<(), String> {
-    let repo_str = repo_root.to_string_lossy();
-    let wt_str = worktree_path.to_string_lossy();
+    let repo_str = repo_root.to_string_lossy().to_string();
+    let wt_str = worktree_path.to_string_lossy().to_string();
 
-    let mut args: Vec<&str> = vec!["-C", &repo_str, "worktree", "add"];
-    args.push(&wt_str);
-    args.push(git_ref);
-
-    let status = Command::new("git")
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to create worktree: {}", e))?;
+    let status = run_git_with_spinner(&["-C", &repo_str, "worktree", "add", &wt_str, git_ref])?;
 
     if !status.success() {
         // Try with FETCH_HEAD if branch is checked out elsewhere
-        let mut args: Vec<&str> = vec!["-C", &repo_str, "worktree", "add"];
-        args.push(&wt_str);
-        args.push("FETCH_HEAD");
-
-        let status = Command::new("git")
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("Failed to create worktree with FETCH_HEAD: {}", e))?;
+        let status = run_git_with_spinner(&["-C", &repo_str, "worktree", "add", &wt_str, "FETCH_HEAD"])?;
 
         if !status.success() {
             return Err("git worktree add failed".to_string());
@@ -1354,30 +1399,14 @@ fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_re
 }
 
 fn create_worktree_new_branch(repo_root: &PathBuf, worktree_path: &PathBuf, branch: &str) -> Result<(), String> {
-    let repo_str = repo_root.to_string_lossy();
-    let wt_str = worktree_path.to_string_lossy();
+    let repo_str = repo_root.to_string_lossy().to_string();
+    let wt_str = worktree_path.to_string_lossy().to_string();
 
-    let mut args: Vec<&str> = vec!["-C", &repo_str, "worktree", "add"];
-    args.extend_from_slice(&["-b", branch, &wt_str, "origin/master"]);
-
-    let status = Command::new("git")
-        .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to create worktree: {}", e))?;
+    let status = run_git_with_spinner(&["-C", &repo_str, "worktree", "add", "-b", branch, &wt_str, "origin/master"])?;
 
     if !status.success() {
-        // Branch may already exist from a previous attempt — try checking it out directly
-        let mut args: Vec<&str> = vec!["-C", &repo_str, "worktree", "add"];
-        args.extend_from_slice(&[&wt_str, branch]);
-
-        let status = Command::new("git")
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("Failed to create worktree: {}", e))?;
+        // Branch may already exist from a previous attempt, try checking it out directly
+        let status = run_git_with_spinner(&["-C", &repo_str, "worktree", "add", &wt_str, branch])?;
 
         if !status.success() {
             return Err("git worktree add failed".to_string());
