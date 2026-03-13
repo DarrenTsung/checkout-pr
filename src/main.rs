@@ -54,6 +54,9 @@ enum Commands {
         /// PR number or GitHub PR URL (e.g., 123 or https://github.com/org/repo/pull/123)
         pr: String,
 
+        /// Optional skill to run after checkout (e.g., /walkthrough)
+        skill: Option<String>,
+
         /// Skip spawning claude after creating the worktree
         #[arg(long)]
         no_claude: bool,
@@ -351,8 +354,8 @@ fn run() -> Result<(), String> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Pr { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr"),
-        Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-and-review-pr"),
+        Commands::Pr { pr, no_claude, repo, skill } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", skill.as_deref()),
+        Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-and-review-pr", None),
         Commands::Branch { name, no_claude, claude_prompt, repo } => run_branch(&name, no_claude, claude_prompt, repo),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
@@ -360,7 +363,7 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str) -> Result<(), String> {
+fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str, chained_skill: Option<&str>) -> Result<(), String> {
     let pr_number = extract_pr_number(pr)?;
     println!(
         "{} PR #{}",
@@ -481,7 +484,10 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str)
             println!();
             spawn_claude_continue(&final_path, Some(&system_prompt))?;
         } else {
-            let full_prompt = format!("{} {}", claude_prompt, pr_number);
+            let full_prompt = match chained_skill {
+                Some(skill) => format!("{} {}\n\nAfter completing the above, run: {}", claude_prompt, pr_number, skill),
+                None => format!("{} {}", claude_prompt, pr_number),
+            };
             println!();
             println!(
                 "{} Spawning claude with {}...",
