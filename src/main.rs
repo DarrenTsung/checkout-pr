@@ -65,6 +65,19 @@ enum Commands {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Check out a GitHub PR into a worktree and generate a walkthrough
+    Walkthrough {
+        /// PR number or GitHub PR URL (e.g., 123 or https://github.com/org/repo/pull/123)
+        pr: String,
+
+        /// Skip spawning claude after creating the worktree
+        #[arg(long)]
+        no_claude: bool,
+
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Check out a GitHub PR into a worktree and review it
     Review {
         /// PR number or GitHub PR URL (e.g., 123 or https://github.com/org/repo/pull/123)
@@ -355,6 +368,7 @@ fn run() -> Result<(), String> {
 
     match cli.command {
         Commands::Pr { pr, no_claude, repo, skill } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", skill.as_deref()),
+        Commands::Walkthrough { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", Some("/walkthrough")),
         Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-and-review-pr", None),
         Commands::Branch { name, no_claude, claude_prompt, repo } => run_branch(&name, no_claude, claude_prompt, repo),
         Commands::Status { repo } => run_status(repo),
