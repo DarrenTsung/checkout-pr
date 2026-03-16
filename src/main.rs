@@ -694,15 +694,39 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
         }
     }
 
-    // Spawn all git-status checks in parallel
-    let children: Vec<_> = entries
+    // Check active sessions first (fast PID file reads) so we can skip
+    // expensive git-status calls for worktrees we're keeping anyway.
+    let session_status: Vec<bool> = entries
         .iter()
         .map(|(path, _)| {
-            Command::new("git")
-                .args(["-C", &path.to_string_lossy(), "status", "--porcelain"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
+            if let Some(pid) = read_session_pid(path) {
+                if is_pid_alive(pid) {
+                    true
+                } else {
+                    remove_session_pid(path); // stale PID file from a crash
+                    false
+                }
+            } else {
+                false
+            }
+        })
+        .collect();
+
+    // Only spawn git-status for inactive worktrees
+    let children: Vec<_> = entries
+        .iter()
+        .zip(&session_status)
+        .map(|((path, _), &active)| {
+            if active {
+                None
+            } else {
+                Command::new("git")
+                    .args(["-C", &path.to_string_lossy(), "status", "--porcelain"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .ok()
+            }
         })
         .collect();
 
@@ -710,21 +734,12 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
     let mut worktrees: Vec<WorktreeInfo> = entries
         .into_iter()
         .zip(children)
-        .map(|((path, branch), child)| {
+        .zip(session_status)
+        .map(|(((path, branch), child), has_active_session)| {
             let has_changes = child
-                .and_then(|c| c.wait_with_output())
+                .and_then(|c| c.wait_with_output().ok())
                 .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
                 .unwrap_or(false);
-            let has_active_session = if let Some(pid) = read_session_pid(&path) {
-                if is_pid_alive(pid) {
-                    true
-                } else {
-                    remove_session_pid(&path); // stale PID file from a crash
-                    false
-                }
-            } else {
-                false
-            };
             let orphaned_pids: Vec<u32> = Vec::new();
             WorktreeInfo { path, branch, has_changes, has_active_session, orphaned_pids }
         })
