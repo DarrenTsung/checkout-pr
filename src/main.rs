@@ -442,8 +442,10 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
             ExistingWorktreeAction::UseExisting => {
                 print!("{} Updating to latest... ", "→".blue().bold());
                 std::io::stdout().flush().ok();
-                update_worktree(&existing_path, &pr_details.head_ref_name)?;
-                println!("{}", "done".green());
+                match update_worktree(&existing_path, &pr_details.head_ref_name) {
+                    Ok(()) => println!("{}", "done".green()),
+                    Err(e) => println!("{}\n  {} {}", "skipped".yellow(), "⚠".yellow().bold(), e.dimmed()),
+                }
                 existing_path
             }
             ExistingWorktreeAction::CreateNew => {
@@ -1437,19 +1439,20 @@ fn create_worktree_new_branch(repo_root: &PathBuf, worktree_path: &PathBuf, bran
 }
 
 fn update_worktree(worktree_path: &PathBuf, branch: &str) -> Result<(), String> {
-    let status = Command::new("git")
+    let output = Command::new("git")
         .args(["-C", &worktree_path.to_string_lossy(), "fetch", "origin", branch])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|e| format!("Failed to fetch: {}", e))?;
 
-    if !status.success() {
-        return Err("git fetch failed".to_string());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git fetch failed: {}", stderr.trim()));
     }
 
     let ref_name = format!("origin/{}", branch);
-    let status = Command::new("git")
+    let output = Command::new("git")
         .args([
             "-C",
             &worktree_path.to_string_lossy(),
@@ -1458,12 +1461,13 @@ fn update_worktree(worktree_path: &PathBuf, branch: &str) -> Result<(), String> 
             &ref_name,
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .map_err(|e| format!("Failed to reset: {}", e))?;
 
-    if !status.success() {
-        return Err("git reset failed".to_string());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git reset failed: {}", stderr.trim()));
     }
 
     Ok(())
