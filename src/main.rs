@@ -411,7 +411,10 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
     let worktree_dir = default_worktree_dir();
     let worktree_path = worktree_dir.join(format!("pr-{}-{}", pr_number, slug));
 
-    let existing = find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?;
+    // Check for an existing worktree by branch name first (from `checkout branch`), then PR prefix
+    let branch_slug = pr_details.head_ref_name.rsplit('/').next().unwrap_or(&pr_details.head_ref_name);
+    let existing = find_existing_worktree(&repo_root, &format!("branch-{}", branch_slug))?
+        .or(find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?);
 
     let mut resume = false;
     let mut is_new_worktree = false;
@@ -423,16 +426,12 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
             existing_path.display().to_string().cyan()
         );
 
-        let has_changes = has_uncommitted_changes(&existing_path)?;
-        if has_changes {
-            println!(
-                "  {} {}",
-                "⚠".yellow().bold(),
-                "Worktree has uncommitted changes!".yellow()
-            );
-        }
+        let changes_handle = {
+            let path = existing_path.clone();
+            thread::spawn(move || has_uncommitted_changes(&path))
+        };
 
-        let action = prompt_existing_worktree_action(has_changes)?;
+        let action = prompt_existing_worktree_action(changes_handle)?;
 
         match action {
             ExistingWorktreeAction::ResumeSession => {
@@ -542,8 +541,9 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
     let worktree_dir = default_worktree_dir();
     let worktree_path = worktree_dir.join(format!("branch-{}", slug));
 
-    // Check if worktree already exists
-    let existing = find_existing_worktree(&repo_root, &format!("branch-{}", slug))?;
+    // Check for an existing worktree by branch directory name or by git branch ref (from `checkout pr`)
+    let existing = find_existing_worktree(&repo_root, &format!("branch-{}", slug))?
+        .or(find_existing_worktree(&repo_root, &format!("[{}]", branch_name))?);
 
     let mut resume = false;
     let mut is_new_worktree = false;
@@ -555,16 +555,12 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
             existing_path.display().to_string().cyan()
         );
 
-        let has_changes = has_uncommitted_changes(&existing_path)?;
-        if has_changes {
-            println!(
-                "  {} {}",
-                "⚠".yellow().bold(),
-                "Worktree has uncommitted changes!".yellow()
-            );
-        }
+        let changes_handle = {
+            let path = existing_path.clone();
+            thread::spawn(move || has_uncommitted_changes(&path))
+        };
 
-        let action = prompt_existing_worktree_action(has_changes)?;
+        let action = prompt_existing_worktree_action(changes_handle)?;
 
         match action {
             ExistingWorktreeAction::ResumeSession => {
@@ -1182,34 +1178,29 @@ fn has_uncommitted_changes(worktree_path: &PathBuf) -> Result<bool, String> {
     Ok(!stdout.trim().is_empty())
 }
 
-fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktreeAction, String> {
-    println!();
-    if has_changes {
-        println!(
-            "  {} Resume last claude session {}",
-            "[1]".cyan().bold(),
-            "(keep changes, skip update)".dimmed()
-        );
-        println!(
-            "  {} Use existing worktree {}",
-            "[2]".cyan().bold(),
-            "(will discard uncommitted changes!)".yellow()
-        );
-        println!("  {} Create new worktree", "[3]".cyan().bold());
-    } else {
-        println!("  {} Use existing worktree", "[1]".cyan().bold());
-        println!("  {} Create new worktree", "[2]".cyan().bold());
-    }
-    println!();
+fn resolve_changes_handle(
+    handle: thread::JoinHandle<Result<bool, String>>,
+) -> Result<bool, String> {
+    handle
+        .join()
+        .map_err(|_| "Failed to check git status".to_string())?
+}
 
-    let valid_options = if has_changes { "1, 2, or 3" } else { "1 or 2" };
+fn prompt_existing_worktree_action(
+    changes_handle: thread::JoinHandle<Result<bool, String>>,
+) -> Result<ExistingWorktreeAction, String> {
+    println!();
+    println!(
+        "  {} Resume last claude session {}",
+        "[1]".cyan().bold(),
+        "(keep changes, skip update)".dimmed()
+    );
+    println!("  {} Use existing worktree", "[2]".cyan().bold());
+    println!("  {} Create new worktree", "[3]".cyan().bold());
+    println!();
 
     loop {
-        if has_changes {
-            print!("{} Choose an option [1/2/3]: ", "?".magenta().bold());
-        } else {
-            print!("{} Choose an option [1/2]: ", "?".magenta().bold());
-        }
+        print!("{} Choose an option [1/2/3]: ", "?".magenta().bold());
         io::stdout().flush().map_err(|e| e.to_string())?;
 
         let mut input = String::new();
@@ -1217,12 +1208,13 @@ fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktree
             .read_line(&mut input)
             .map_err(|e| format!("Failed to read input: {}", e))?;
 
-        if has_changes {
-            match input.trim() {
-                "1" => return Ok(ExistingWorktreeAction::ResumeSession),
-                "2" => {
+        match input.trim() {
+            "1" => return Ok(ExistingWorktreeAction::ResumeSession),
+            "2" => {
+                let has_changes = resolve_changes_handle(changes_handle)?;
+                if has_changes {
                     print!(
-                        "{} Are you sure you want to discard changes? [y/N]: ",
+                        "{} Worktree has uncommitted changes. Discard them? [y/N]: ",
                         "!".yellow().bold()
                     );
                     io::stdout().flush().map_err(|e| e.to_string())?;
@@ -1234,22 +1226,18 @@ fn prompt_existing_worktree_action(has_changes: bool) -> Result<ExistingWorktree
 
                     if confirm.trim().to_lowercase() != "y" {
                         println!("{} Cancelled", "→".blue().bold());
-                        continue;
+                        std::process::exit(0);
                     }
-                    return Ok(ExistingWorktreeAction::UseExisting);
                 }
-                "3" => return Ok(ExistingWorktreeAction::CreateNew),
-                _ => {
-                    println!("{} Invalid option, please enter {}", "!".red().bold(), valid_options);
-                }
+                return Ok(ExistingWorktreeAction::UseExisting);
             }
-        } else {
-            match input.trim() {
-                "1" => return Ok(ExistingWorktreeAction::UseExisting),
-                "2" => return Ok(ExistingWorktreeAction::CreateNew),
-                _ => {
-                    println!("{} Invalid option, please enter {}", "!".red().bold(), valid_options);
-                }
+            "3" => return Ok(ExistingWorktreeAction::CreateNew),
+            _ => {
+                println!(
+                    "{} Invalid option, please enter {}",
+                    "!".red().bold(),
+                    "1, 2, or 3"
+                );
             }
         }
     }
