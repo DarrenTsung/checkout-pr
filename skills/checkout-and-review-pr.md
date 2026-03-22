@@ -300,52 +300,70 @@ Spawn a teammate with this prompt:
 
 ---
 
-## Phase 3: Aggregate and Present Results
+## Phase 3: Write Review File
 
-Wait for all teammates to complete their reviews. Then synthesize their findings into a single review.
+Wait for all teammates to complete their reviews. Then synthesize their findings into a structured markdown file.
 
-**Cross-reference with PR comments:** Before presenting each finding, check if it was already acknowledged or discussed in the PR comments you fetched in Phase 1. If the author or a reviewer already called out the issue, note that it's a known concern with a brief reference (e.g., "Acknowledged by author in PR comments — decided to defer to follow-up"). Still include the finding, but mark it so the user can skip over known items.
+**Cross-reference with PR comments:** Before writing each finding, check if it was already acknowledged or discussed in the PR comments you fetched in Phase 1. If the author or a reviewer already called out the issue, append "(Acknowledged by author in PR comments)" to the description.
 
----
+**Consolidate duplicates:** If multiple teammates flag the same issue, write it once in the most relevant section.
 
-## Code Review Summary
+Write `review.md` to the worktree root with this structure:
 
-### Correctness
-[Teammate 1 findings]
+```markdown
+# Code Review: PR #<number> - <title>
 
-### Test Coverage
-[Teammate 2 findings]
+> <1-3 sentence summary of the PR>
 
-### Test Readability
-[Teammate 3 findings]
+## Correctness
 
-### Test Timing
-[Teammate 4 findings]
+### <Concise finding title>
 
-### Test Value
-[Teammate 5 findings]
+`path/to/file.ts:123` - <description of the issue>
 
-### Coherence
-[Teammate 6 findings]
+### <Another finding>
 
-### Risks
-[Teammate 7 findings]
+`path/to/file.ts:456` - <description>
 
-### Multiplayer (if applicable)
-[Teammate 8 findings]
+## Test Coverage
+### ...
 
-### Go Style (if applicable)
-[Teammate 9 findings]
+## Test Readability
+### ...
 
----
+## Test Timing
+### ...
 
-**IMPORTANT:** Only report unique issues. If multiple teammates flag the same issue, consolidate into one finding.
+## Test Value
+### ...
+
+## Coherence
+### ...
+
+## Risks
+### ...
+
+## Multiplayer
+### ...
+
+## Go Style
+### ...
+```
+
+Rules:
+- Each reviewer section is an `##` heading. Each finding is a `###` subsection.
+- The description paragraph starts with a backtick-wrapped `file:line` reference.
+- If no findings for a section, write "No issues found." with no subsections.
+- Omit the Multiplayer section if the PR doesn't touch multiplayer code.
+- Omit the Go Style section if the PR doesn't touch Go code.
 
 ---
 
 ## Phase 4: Interactive Q&A
 
-After presenting the review summary, ask the user what specific questions they have about the PR. Common questions might include:
+After writing the file, tell the user: "Review written to `review.md`."
+
+Then ask the user what specific questions they have about the PR. Common questions might include:
 - Why certain code can be deleted
 - How a feature flag cleanup affects the codebase
 - What the test changes are validating
