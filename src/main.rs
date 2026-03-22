@@ -428,7 +428,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
 
         let changes_handle = {
             let path = existing_path.clone();
-            thread::spawn(move || has_uncommitted_changes(&path))
+            thread::spawn(move || get_uncommitted_status(&path))
         };
 
         let action = prompt_existing_worktree_action(changes_handle)?;
@@ -557,7 +557,7 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
 
         let changes_handle = {
             let path = existing_path.clone();
-            thread::spawn(move || has_uncommitted_changes(&path))
+            thread::spawn(move || get_uncommitted_status(&path))
         };
 
         let action = prompt_existing_worktree_action(changes_handle)?;
@@ -1168,26 +1168,23 @@ fn create_new_worktree_new_branch(
     Ok(())
 }
 
-fn has_uncommitted_changes(worktree_path: &PathBuf) -> Result<bool, String> {
+/// Returns the short status output if there are uncommitted changes, None otherwise.
+fn get_uncommitted_status(worktree_path: &PathBuf) -> Result<Option<String>, String> {
     let output = Command::new("git")
-        .args(["-C", &worktree_path.to_string_lossy(), "status", "--porcelain"])
+        .args(["-C", &worktree_path.to_string_lossy(), "status", "--short"])
         .output()
         .map_err(|e| format!("Failed to check git status: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(!stdout.trim().is_empty())
-}
-
-fn resolve_changes_handle(
-    handle: thread::JoinHandle<Result<bool, String>>,
-) -> Result<bool, String> {
-    handle
-        .join()
-        .map_err(|_| "Failed to check git status".to_string())?
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(stdout))
+    }
 }
 
 fn prompt_existing_worktree_action(
-    changes_handle: thread::JoinHandle<Result<bool, String>>,
+    changes_handle: thread::JoinHandle<Result<Option<String>, String>>,
 ) -> Result<ExistingWorktreeAction, String> {
     println!();
     println!(
@@ -1211,10 +1208,21 @@ fn prompt_existing_worktree_action(
         match input.trim() {
             "1" => return Ok(ExistingWorktreeAction::ResumeSession),
             "2" => {
-                let has_changes = resolve_changes_handle(changes_handle)?;
-                if has_changes {
+                let status = changes_handle
+                    .join()
+                    .map_err(|_| "Failed to check git status".to_string())??;
+                if let Some(changes) = status {
+                    println!();
+                    println!(
+                        "{} Worktree has uncommitted changes:",
+                        "!".yellow().bold()
+                    );
+                    for line in changes.lines() {
+                        println!("  {}", line.dimmed());
+                    }
+                    println!();
                     print!(
-                        "{} Worktree has uncommitted changes. Discard them? [y/N]: ",
+                        "{} Discard these changes? [y/N]: ",
                         "!".yellow().bold()
                     );
                     io::stdout().flush().map_err(|e| e.to_string())?;
