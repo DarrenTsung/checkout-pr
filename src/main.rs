@@ -383,6 +383,8 @@ struct PidFileGuard {
 impl PidFileGuard {
     fn new(worktree_path: &Path, pid: u32) -> Self {
         write_session_pid(worktree_path, pid);
+        // Clear the exited marker so this worktree isn't considered idle
+        let _ = fs::remove_file(session_exited_file(worktree_path));
         Self {
             worktree_path: worktree_path.to_path_buf(),
         }
@@ -720,7 +722,161 @@ fn generate_workspace_name() -> String {
     format!("{}-{}", adj, noun)
 }
 
+/// Check if a worktree directory name matches the adjective-noun pattern from `checkout new`.
+fn is_checkout_new_worktree(dir_name: &str) -> bool {
+    let slug = dir_name.strip_prefix("branch-").unwrap_or(dir_name);
+    let parts: Vec<&str> = slug.splitn(2, '-').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    ADJECTIVES.contains(&parts[0]) && NOUNS.contains(&parts[1])
+}
+
+/// Find the oldest idle worktree created by `checkout new`:
+/// no active session, has an .exited file, and no uncommitted changes.
+fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String> {
+    let entries = list_worktree_paths(repo_root)?;
+
+    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
+
+    for (path, _branch) in &entries {
+        let dir_name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if !is_checkout_new_worktree(dir_name) {
+            continue;
+        }
+
+        // Must have an .exited file (session ended and not resumed)
+        let exited_file = session_exited_file(path);
+        let content = match fs::read_to_string(&exited_file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let timestamp: u64 = match content.lines().next().and_then(|l| l.trim().parse().ok()) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // Must not have an active session
+        if let Some(pid) = read_session_pid(path) {
+            if is_pid_alive(pid) {
+                continue;
+            }
+        }
+
+        // Must not have uncommitted changes
+        match get_uncommitted_status(path)? {
+            Some(_) => continue,
+            None => {}
+        }
+
+        candidates.push((timestamp, path.clone()));
+    }
+
+    // Pick the oldest (earliest exit timestamp)
+    candidates.sort_by_key(|(ts, _)| *ts);
+    Ok(candidates.into_iter().next().map(|(_, path)| path))
+}
+
+fn reset_worktree_to_master(worktree_path: &PathBuf) -> Result<(), String> {
+    // Fetch latest master
+    print!("{} Fetching latest master... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    let status = Command::new("git")
+        .args(["-C", &worktree_path.to_string_lossy(), "fetch", "origin", "master"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to fetch: {}", e))?;
+    if !status.success() {
+        return Err("Failed to fetch origin/master".to_string());
+    }
+    println!("{}", "done".green());
+
+    // Reset branch to origin/master
+    print!("{} Resetting to latest master... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    let status = Command::new("git")
+        .args(["-C", &worktree_path.to_string_lossy(), "reset", "--hard", "origin/master"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Failed to reset: {}", e))?;
+    if !status.success() {
+        return Err("Failed to reset to origin/master".to_string());
+    }
+    println!("{}", "done".green());
+
+    Ok(())
+}
+
 fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf>) -> Result<(), String> {
+    let repo_root = repo.clone().unwrap_or_else(default_repo_root);
+
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+
+    // Try to reuse an idle scratch worktree
+    if let Some(reusable) = find_reusable_worktree(&repo_root)? {
+        let dir_name = reusable.file_name().unwrap().to_string_lossy().to_string();
+        let workspace_name = dir_name.strip_prefix("branch-").unwrap_or(&dir_name);
+
+        println!(
+            "{} Recycling idle workspace {}",
+            "→".blue().bold(),
+            workspace_name.cyan()
+        );
+
+        reset_worktree_to_master(&reusable)?;
+
+        println!();
+        println!(
+            "{} Worktree ready at {}",
+            "✓".green().bold(),
+            reusable.display().to_string().cyan().bold()
+        );
+
+        if no_claude {
+            println!(
+                "\n{} Run: {} {} {}",
+                "tip:".yellow().bold(),
+                "cd".dimmed(),
+                reusable.display(),
+                "&& claude".dimmed()
+            );
+        } else {
+            let bg_color = pick_available_color(&reusable);
+            save_worktree_color(&reusable, &bg_color)?;
+
+            let branch_name = format!("darren/{}", workspace_name);
+            let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
+
+            let system_prompt = build_worktree_system_prompt();
+
+            println!();
+            println!(
+                "{} Spawning claude...",
+                "→".blue().bold(),
+            );
+            println!();
+
+            if let Some(prompt_path) = claude_prompt {
+                let content = fs::read_to_string(&prompt_path)
+                    .map_err(|e| format!("Failed to read prompt file {}: {}", prompt_path.display(), e))?;
+                spawn_claude_with_prompt(&reusable, &content, Some(&system_prompt))?;
+            } else {
+                spawn_claude(&reusable, Some(&system_prompt))?;
+            }
+        }
+
+        return Ok(());
+    }
+
+    // No reusable worktree, create a new one
     let workspace_name = generate_workspace_name();
     let branch_name = format!("darren/{}", workspace_name);
 
