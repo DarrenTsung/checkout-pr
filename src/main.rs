@@ -108,6 +108,20 @@ enum Commands {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Create a new worktree with a random name
+    New {
+        /// Skip spawning claude after creating the worktree
+        #[arg(long)]
+        no_claude: bool,
+
+        /// Path to a file whose contents will be used as the initial Claude prompt
+        #[arg(long)]
+        claude_prompt: Option<PathBuf>,
+
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// List all worktrees and their status
     Status {
         /// Path to the repo (default: $CHECKOUT_REPO)
@@ -126,6 +140,12 @@ enum Commands {
     },
     /// Browse worktrees with Claude sessions and resume one
     Resume {
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Resume the most recently exited Claude session
+    ResumeLast {
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -297,12 +317,19 @@ fn get_session_dir() -> PathBuf {
     PathBuf::from(format!("{}/.local/share/checkout/sessions", home))
 }
 
-fn session_pid_file(worktree_path: &Path) -> PathBuf {
-    let name = worktree_path
+fn session_file_name(worktree_path: &Path) -> String {
+    worktree_path
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    get_session_dir().join(format!("{}.pid", name))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn session_pid_file(worktree_path: &Path) -> PathBuf {
+    get_session_dir().join(format!("{}.pid", session_file_name(worktree_path)))
+}
+
+fn session_exited_file(worktree_path: &Path) -> PathBuf {
+    get_session_dir().join(format!("{}.exited", session_file_name(worktree_path)))
 }
 
 fn write_session_pid(worktree_path: &Path, pid: u32) {
@@ -313,6 +340,19 @@ fn write_session_pid(worktree_path: &Path, pid: u32) {
 
 fn remove_session_pid(worktree_path: &Path) {
     let _ = fs::remove_file(session_pid_file(worktree_path));
+}
+
+fn write_session_exited(worktree_path: &Path) {
+    let dir = get_session_dir();
+    let _ = fs::create_dir_all(&dir);
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = fs::write(
+        session_exited_file(worktree_path),
+        format!("{}\n{}", timestamp, worktree_path.display()),
+    );
 }
 
 fn read_session_pid(worktree_path: &Path) -> Option<u32> {
@@ -352,6 +392,7 @@ impl PidFileGuard {
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
         remove_session_pid(&self.worktree_path);
+        write_session_exited(&self.worktree_path);
     }
 }
 
@@ -371,9 +412,11 @@ fn run() -> Result<(), String> {
         Commands::Walkthrough { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", Some("/walkthrough")),
         Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-and-review-pr", None),
         Commands::Branch { name, no_claude, claude_prompt, repo } => run_branch(&name, no_claude, claude_prompt, repo),
+        Commands::New { no_claude, claude_prompt, repo } => run_new(no_claude, claude_prompt, repo),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
         Commands::Resume { repo } => run_resume(repo),
+        Commands::ResumeLast { repo } => run_resume_last(repo),
     }
 }
 
@@ -650,6 +693,44 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
     }
 
     Ok(())
+}
+
+const ADJECTIVES: &[&str] = &[
+    "azure", "bold", "calm", "deft", "eager", "fair", "glad", "hale",
+    "keen", "lush", "mild", "neat", "open", "pure", "quick", "rare",
+    "sage", "tame", "vast", "warm", "zesty", "brave", "crisp", "dense",
+    "fond", "grim", "hazy", "idle", "just", "kind", "lean", "mute",
+];
+
+const NOUNS: &[&str] = &[
+    "brook", "cedar", "dune", "elm", "flint", "grove", "heron", "iris",
+    "jade", "knoll", "lark", "moss", "nova", "oak", "pine", "quartz",
+    "reef", "slate", "thorn", "vale", "wren", "birch", "cliff", "delta",
+    "fern", "glade", "hawk", "isle", "junco", "kelp", "lynx", "marsh",
+];
+
+fn generate_workspace_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize;
+
+    let adj = ADJECTIVES[nanos % ADJECTIVES.len()];
+    let noun = NOUNS[(nanos / ADJECTIVES.len()) % NOUNS.len()];
+    format!("{}-{}", adj, noun)
+}
+
+fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf>) -> Result<(), String> {
+    let workspace_name = generate_workspace_name();
+    let branch_name = format!("darren/{}", workspace_name);
+
+    println!(
+        "{} New workspace {}",
+        "→".blue().bold(),
+        workspace_name.cyan()
+    );
+
+    run_branch(&branch_name, no_claude, claude_prompt, repo)
 }
 
 #[derive(Clone)]
@@ -2051,6 +2132,95 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
     );
 
     spawn_claude_continue(worktree_path, None)?;
+
+    Ok(())
+}
+
+fn run_resume_last(repo: Option<PathBuf>) -> Result<(), String> {
+    let repo_root = repo.unwrap_or_else(default_repo_root);
+
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+
+    // Read all .exited files, find the most recent one whose worktree still exists
+    // and doesn't have an active session
+    let session_dir = get_session_dir();
+    let entries = fs::read_dir(&session_dir)
+        .map_err(|e| format!("Failed to read session dir: {}", e))?;
+
+    let mut best: Option<(u64, PathBuf)> = None;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("exited") {
+            continue;
+        }
+
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let mut lines = content.lines();
+        let timestamp: u64 = match lines.next().and_then(|l| l.trim().parse().ok()) {
+            Some(t) => t,
+            None => continue,
+        };
+        let worktree_path = match lines.next() {
+            Some(p) => PathBuf::from(p.trim()),
+            None => continue,
+        };
+
+        // Skip if worktree no longer exists
+        if !worktree_path.exists() {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+
+        // Skip if there's an active session
+        if let Some(pid) = read_session_pid(&worktree_path) {
+            if is_pid_alive(pid) {
+                continue;
+            }
+        }
+
+        if best.as_ref().map_or(true, |(ts, _)| timestamp > *ts) {
+            best = Some((timestamp, worktree_path));
+        }
+    }
+
+    let Some((_timestamp, worktree_path)) = best else {
+        println!("{} No recently exited sessions found", "!".yellow().bold());
+        return Ok(());
+    };
+
+    let branch = worktree_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!(
+        "{} Resuming last session in {}",
+        "→".blue().bold(),
+        worktree_path.display().to_string().cyan()
+    );
+
+    let bg_color = pick_available_color(&worktree_path);
+    save_worktree_color(&worktree_path, &bg_color)?;
+
+    let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch));
+
+    let system_prompt = build_worktree_system_prompt();
+
+    println!();
+    println!(
+        "{} Resuming claude session...",
+        "→".blue().bold(),
+    );
+    println!();
+
+    spawn_claude_continue(&worktree_path, Some(&system_prompt))?;
 
     Ok(())
 }
