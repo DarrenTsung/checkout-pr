@@ -38,6 +38,57 @@ const COLOR_PALETTE: &[&str] = &[
     "1f332b", // soft teal
 ];
 
+static TIMINGS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static TIMING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct TimingSpan {
+    label: String,
+    start: Instant,
+}
+
+impl TimingSpan {
+    fn new(label: &str) -> Self {
+        if TIMINGS_ENABLED.load(Ordering::Relaxed) {
+            let depth = TIMING_DEPTH.with(|d| d.get());
+            let indent = "  ".repeat(depth);
+            eprintln!("{}⏱ {} ...", indent, label.dimmed());
+            TIMING_DEPTH.with(|d| d.set(depth + 1));
+        }
+        Self {
+            label: label.to_string(),
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for TimingSpan {
+    fn drop(&mut self) {
+        if TIMINGS_ENABLED.load(Ordering::Relaxed) {
+            TIMING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            let depth = TIMING_DEPTH.with(|d| d.get());
+            let indent = "  ".repeat(depth);
+            let elapsed = self.start.elapsed();
+            let ms = elapsed.as_millis();
+            let time_str = if ms >= 1000 {
+                format!("{:.1}s", elapsed.as_secs_f64())
+            } else {
+                format!("{}ms", ms)
+            };
+            eprintln!("{}⏱ {} {}", indent, self.label.dimmed(), time_str.yellow());
+        }
+    }
+}
+
+/// Convenience macro for creating a timing span in the current scope.
+macro_rules! timing {
+    ($label:expr) => {
+        let _timing_span = TimingSpan::new($label);
+    };
+}
+
 #[derive(Parser)]
 #[command(name = "checkout")]
 #[command(about = "Create git worktrees for PRs or new branches")]
@@ -45,6 +96,10 @@ const COLOR_PALETTE: &[&str] = &[
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Print timing information for each operation
+    #[arg(long, global = true)]
+    timings: bool,
 }
 
 #[derive(Subcommand)]
@@ -349,9 +404,14 @@ fn write_session_exited(worktree_path: &Path) {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let clean = Command::new("git")
+        .args(["-C", &worktree_path.to_string_lossy(), "status", "--short"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
     let _ = fs::write(
         session_exited_file(worktree_path),
-        format!("{}\n{}", timestamp, worktree_path.display()),
+        format!("{}\n{}\n{}", timestamp, worktree_path.display(), if clean { "clean" } else { "dirty" }),
     );
 }
 
@@ -409,6 +469,10 @@ fn default_worktree_dir() -> PathBuf {
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
 
+    if cli.timings {
+        TIMINGS_ENABLED.store(true, Ordering::Relaxed);
+    }
+
     match cli.command {
         Commands::Pr { pr, no_claude, repo, skill } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", skill.as_deref()),
         Commands::Walkthrough { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", Some("/walkthrough")),
@@ -423,6 +487,7 @@ fn run() -> Result<(), String> {
 }
 
 fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str, chained_skill: Option<&str>) -> Result<(), String> {
+    timing!("run_pr");
     let pr_number = extract_pr_number(pr)?;
     println!(
         "{} PR #{}",
@@ -567,6 +632,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
 }
 
 fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf>) -> Result<(), String> {
+    timing!("run_branch");
     let branch_name = name.to_string();
 
     println!(
@@ -735,6 +801,7 @@ fn is_checkout_new_worktree(dir_name: &str) -> bool {
 /// Find the oldest idle worktree created by `checkout new`:
 /// no active session, has an .exited file, and no uncommitted changes.
 fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String> {
+    timing!("find_reusable_worktree");
     let entries = list_worktree_paths(repo_root)?;
 
     let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
@@ -755,22 +822,24 @@ fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String
             Ok(c) => c,
             Err(_) => continue,
         };
-        let timestamp: u64 = match content.lines().next().and_then(|l| l.trim().parse().ok()) {
+        let mut lines = content.lines();
+        let timestamp: u64 = match lines.next().and_then(|l| l.trim().parse().ok()) {
             Some(t) => t,
             None => continue,
         };
+        // Skip the worktree path line
+        let _ = lines.next();
+        // Check the clean/dirty status recorded at exit time
+        let status = lines.next().unwrap_or("dirty").trim();
+        if status != "clean" {
+            continue;
+        }
 
         // Must not have an active session
         if let Some(pid) = read_session_pid(path) {
             if is_pid_alive(pid) {
                 continue;
             }
-        }
-
-        // Must not have uncommitted changes
-        match get_uncommitted_status(path)? {
-            Some(_) => continue,
-            None => {}
         }
 
         candidates.push((timestamp, path.clone()));
@@ -782,6 +851,7 @@ fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String
 }
 
 fn reset_worktree_to_master(worktree_path: &PathBuf) -> Result<(), String> {
+    timing!("reset_worktree_to_master");
     // Fetch latest master
     print!("{} Fetching latest master... ", "→".blue().bold());
     std::io::stdout().flush().ok();
@@ -814,6 +884,7 @@ fn reset_worktree_to_master(worktree_path: &PathBuf) -> Result<(), String> {
 }
 
 fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf>) -> Result<(), String> {
+    timing!("run_new");
     let repo_root = repo.clone().unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
@@ -985,6 +1056,7 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
 }
 
 fn run_status(repo: Option<PathBuf>) -> Result<(), String> {
+    timing!("run_status");
     let repo_root = repo.unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
@@ -1114,6 +1186,7 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
 }
 
 fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
+    timing!("run_clean");
     let repo_root = repo.unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
@@ -1314,6 +1387,7 @@ fn create_new_worktree_from_remote(
     branch: &str,
     pr_number: u64,
 ) -> Result<(), String> {
+    timing!("create_new_worktree_from_remote");
     std::fs::create_dir_all(worktree_dir)
         .map_err(|e| format!("Failed to create worktrees dir: {}", e))?;
 
@@ -1363,6 +1437,7 @@ fn create_new_worktree_new_branch(
     worktree_path: &PathBuf,
     branch: &str,
 ) -> Result<(), String> {
+    timing!("create_new_worktree_new_branch");
     std::fs::create_dir_all(worktree_dir)
         .map_err(|e| format!("Failed to create worktrees dir: {}", e))?;
 
@@ -1407,6 +1482,7 @@ fn create_new_worktree_new_branch(
 
 /// Returns the short status output if there are uncommitted changes, None otherwise.
 fn get_uncommitted_status(worktree_path: &PathBuf) -> Result<Option<String>, String> {
+    timing!("get_uncommitted_status");
     let output = Command::new("git")
         .args(["-C", &worktree_path.to_string_lossy(), "status", "--short"])
         .output()
@@ -1524,6 +1600,7 @@ fn extract_pr_number(input: &str) -> Result<u64, String> {
 }
 
 fn fetch_pr_details(pr_number: u64, repo_root: &PathBuf) -> Result<PrDetails, String> {
+    timing!("fetch_pr_details");
     let output = Command::new("gh")
         .args(["pr", "view", &pr_number.to_string(), "--json", "headRefName,title"])
         .current_dir(repo_root)
@@ -1565,6 +1642,7 @@ fn create_slug(title: &str) -> String {
 }
 
 fn find_existing_worktree(repo_root: &PathBuf, pattern: &str) -> Result<Option<PathBuf>, String> {
+    timing!(&format!("find_existing_worktree({})", pattern));
     let output = Command::new("git")
         .args(["-C", &repo_root.to_string_lossy(), "worktree", "list"])
         .output()
@@ -1636,18 +1714,26 @@ fn run_git_with_spinner(args: &[&str]) -> Result<std::process::ExitStatus, Strin
 }
 
 fn fetch_branch(repo_root: &PathBuf, branch: &str) -> Result<(), String> {
-    let status = Command::new("git")
-        .args(["-C", &repo_root.to_string_lossy(), "fetch", "origin", branch])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to fetch: {}", e))?;
+    timing!(&format!("fetch_branch({})", branch));
+    let max_retries = 3;
+    for attempt in 1..=max_retries {
+        let status = Command::new("git")
+            .args(["-C", &repo_root.to_string_lossy(), "fetch", "origin", branch])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("Failed to fetch: {}", e))?;
 
-    if !status.success() {
-        return Err("git fetch failed".to_string());
+        if status.success() {
+            return Ok(());
+        }
+
+        if attempt < max_retries {
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 
-    Ok(())
+    Err("git fetch failed after 3 attempts".to_string())
 }
 
 fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_ref: &str) -> Result<(), String> {
@@ -1669,6 +1755,7 @@ fn create_worktree_from_ref(repo_root: &PathBuf, worktree_path: &PathBuf, git_re
 }
 
 fn create_worktree_new_branch(repo_root: &PathBuf, worktree_path: &PathBuf, branch: &str) -> Result<(), String> {
+    timing!("create_worktree_new_branch (git worktree add)");
     let repo_str = repo_root.to_string_lossy().to_string();
     let wt_str = worktree_path.to_string_lossy().to_string();
 
@@ -1687,16 +1774,30 @@ fn create_worktree_new_branch(repo_root: &PathBuf, worktree_path: &PathBuf, bran
 }
 
 fn update_worktree(worktree_path: &PathBuf, branch: &str) -> Result<(), String> {
-    let output = Command::new("git")
-        .args(["-C", &worktree_path.to_string_lossy(), "fetch", "origin", branch])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to fetch: {}", e))?;
+    timing!("update_worktree");
+    let max_retries = 3;
+    let mut last_stderr = String::new();
+    for attempt in 1..=max_retries {
+        let output = Command::new("git")
+            .args(["-C", &worktree_path.to_string_lossy(), "fetch", "origin", branch])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("Failed to fetch: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git fetch failed: {}", stderr.trim()));
+        if output.status.success() {
+            last_stderr.clear();
+            break;
+        }
+
+        last_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if attempt < max_retries {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    if !last_stderr.is_empty() {
+        return Err(format!("git fetch failed after {} attempts: {}", max_retries, last_stderr));
     }
 
     let ref_name = format!("origin/{}", branch);
@@ -1747,6 +1848,7 @@ fn run_mise_trust(worktree_path: &PathBuf) -> Result<(), String> {
 }
 
 fn run_gt_track(worktree_path: &PathBuf) -> Result<(), String> {
+    timing!("run_gt_track");
     let status = Command::new("gt")
         .args(["track", "--no-interactive"])
         .current_dir(worktree_path)
@@ -1812,6 +1914,7 @@ fn symlink_node_modules(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<
 }
 
 fn symlink_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
+    timing!("symlink_claude_settings");
     // Symlink the main repo's .claude/settings.local.json into the worktree
     // This contains MCP server configurations and other local settings
     let source = repo_root.join(".claude/settings.local.json");
@@ -1849,6 +1952,7 @@ fn symlink_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Resu
 }
 
 fn add_claude_trust(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
+    timing!("add_claude_trust");
     let home = env::var("HOME").map_err(|_| "HOME not set")?;
     let claude_json_path = PathBuf::from(format!("{}/.claude.json", home));
 
@@ -2191,6 +2295,7 @@ fn format_time_ago(time: SystemTime) -> String {
 /// Lightweight worktree listing: just parses `git worktree list --porcelain`
 /// without spawning any git-status or process-detection subcommands.
 fn list_worktree_paths(repo_root: &PathBuf) -> Result<Vec<(PathBuf, String)>, String> {
+    timing!("list_worktree_paths");
     let output = Command::new("git")
         .args(["-C", &repo_root.to_string_lossy(), "worktree", "list", "--porcelain"])
         .output()
@@ -2221,6 +2326,7 @@ fn list_worktree_paths(repo_root: &PathBuf) -> Result<Vec<(PathBuf, String)>, St
 }
 
 fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
+    timing!("run_resume");
     let repo_root = repo.unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
@@ -2293,6 +2399,7 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
 }
 
 fn run_resume_last(repo: Option<PathBuf>) -> Result<(), String> {
+    timing!("run_resume_last");
     let repo_root = repo.unwrap_or_else(default_repo_root);
 
     if !repo_root.exists() {
