@@ -25,20 +25,37 @@ Checkout and review PR $ARGUMENTS using the gh CLI tool.
 
 ## Phase 2: Code Review
 
-Run `/checkout:review <PR_NUMBER>` to perform the full code review and write findings to `review.md`.
+Run `/checkout:review <PR_NUMBER>` to perform the full code review and write findings to `review.md`. Then open in md-annotate: `md-annotate open review.md`.
 
 ---
 
 ## Phase 3: Interactive Q&A
 
-After the review is complete, ask the user what specific questions they have about the PR. Common questions might include:
-- Why certain code can be deleted
-- How a feature flag cleanup affects the codebase
-- What the test changes are validating
-- Whether there are any concerns with the approach
-- Deeper exploration of any review findings
+After the review is complete, tell the user: "Review written to `review.md` and opened in md-annotate. Click **Elaborate**, **Fix**, or **Ignore** on any finding, or ask me questions about the PR."
 
-When answering questions:
+### Handling md-annotate actions
+
+Wait for `[md-annotate]` messages. When one arrives:
+
+1. Run `md-annotate next` to get the next pending annotation.
+2. Based on the action:
+   - **Elaborate**: Provide a deeper explanation of the finding. Include code examples, explain why it matters, reference the specific code in the diff, and describe what could go wrong. Use `md-annotate reply <id> "text"` to respond. Update the document (see checklist below).
+   - **Fix**: Make the fix in the codebase. Use `md-annotate reply --resolve <id> "text"` to reply with what was changed. Update the document (see checklist below). Do NOT push the commit.
+   - **Ignore**: Use `md-annotate reply --resolve <id> "Ignored."` to resolve. Update the document (see checklist below).
+3. After replying, run `md-annotate next` again to check for more pending annotations.
+
+### Document update checklist
+
+**After EVERY outcome change**, update ALL of the following. Do not skip any:
+
+1. **`###` title emoji**: ◯ → 🟣 (elaborate/in-progress), 🟡 (ignored), or 🟢 (done)
+2. **`**Outcome:**`** in the block quote: `N/A` → `Done` or `Ignored`
+3. **Summary table row emoji**: same emoji as the `###` title
+4. **Summary table Outcome column**: `N/A` → `Done` or `Ignored`
+
+### Handling regular conversation
+
+Also respond to regular conversation messages (not from md-annotate). When answering questions:
 - Reference specific lines from the diff when relevant
 - Use `gh pr diff <PR_NUMBER>` to get more context if needed
 - If you need to understand existing code better, read files directly (you're already in the worktree)

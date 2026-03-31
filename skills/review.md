@@ -312,15 +312,32 @@ Write `review.md` to the worktree root with this structure:
 
 > <1-3 sentence summary of the PR>
 
+## Summary
+
+| # | Finding | Outcome |
+|---|---------|---------|
+| 1 | ◯ <short description> | N/A |
+| 2 | ◯ ... | N/A |
+
 ## Correctness
 
-### <Concise finding title>
+### ◯ <Concise finding title> <!-- @actions: elaborate, fix, ignore -->
 
-`path/to/file.ts:123` - <description of the issue>
+> **Recommendation:** <Fix. / Ignore. / Follow-up.> <rationale>
+>
+> **Outcome:** N/A
+>
+> `path/to/file.ts:123` - <description of the issue>
 
-### <Another finding>
+<br>
 
-`path/to/file.ts:456` - <description>
+### ◯ <Another finding> <!-- @actions: elaborate, fix, ignore -->
+
+> **Recommendation:** <Fix. / Ignore. / Follow-up.> <rationale>
+>
+> **Outcome:** N/A
+>
+> `path/to/file.ts:456` - <description>
 
 ## Test Coverage
 ### ...
@@ -349,8 +366,14 @@ Write `review.md` to the worktree root with this structure:
 
 Rules:
 - Each reviewer section is an `##` heading. Each finding is a `###` subsection.
+- The finding body (Recommendation, Outcome, and description) is a single block quote.
+- The recommendation MUST start with a single capitalized action word followed by a period, then the rationale: **Fix.**, **Ignore.**, or **Follow-up.**
+- Every `###` finding title and its corresponding summary table row start with a status emoji: ◯ (no outcome), 🟣 (in progress/elaborate), 🟡 (ignored), 🟢 (done/fixed). Initially all are ◯.
+- Add `<br>` between findings within the same `##` section (between the end of one block quote and the next `###` heading).
 - The description paragraph starts with a backtick-wrapped `file:line` reference.
-- If no findings for a section, write "No issues found." with no subsections.
+- The `<!-- @actions: elaborate, fix, ignore -->` comment goes on the `###` heading line itself (e.g., `### ◯ Finding title <!-- @actions: elaborate, fix, ignore -->`).
+- Add a numbered summary table at the top with all findings. Outcome is initially `N/A`.
+- If no findings for a section, write "No issues found." with no subsections (no `@actions` comment).
 - Omit the Multiplayer section if the PR doesn't touch multiplayer code.
 - Omit the Go Style section if the PR doesn't touch Go code.
 

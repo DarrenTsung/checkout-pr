@@ -315,15 +315,32 @@ Write `review.md` to the worktree root with this structure:
 
 > <1-3 sentence summary of the PR>
 
+## Summary
+
+| # | Finding | Outcome |
+|---|---------|---------|
+| 1 | ◯ <short description> | N/A |
+| 2 | ◯ ... | N/A |
+
 ## Correctness
 
-### <Concise finding title> <!-- @actions: elaborate, fix -->
+### ◯ <Concise finding title> <!-- @actions: elaborate, fix, ignore -->
 
-`path/to/file.ts:123` - <description of the issue>
+> **Recommendation:** <Fix. / Ignore. / Follow-up.> <rationale>
+>
+> **Outcome:** N/A
+>
+> `path/to/file.ts:123` - <description of the issue>
 
-### <Another finding> <!-- @actions: elaborate, fix -->
+<br>
 
-`path/to/file.ts:456` - <description>
+### ◯ <Another finding> <!-- @actions: elaborate, fix, ignore -->
+
+> **Recommendation:** <Fix. / Ignore. / Follow-up.> <rationale>
+>
+> **Outcome:** N/A
+>
+> `path/to/file.ts:456` - <description>
 
 ## Test Coverage
 ### ...
@@ -352,9 +369,13 @@ Write `review.md` to the worktree root with this structure:
 
 Rules:
 - Each reviewer section is an `##` heading. Each finding is a `###` subsection.
+- The finding body (Recommendation, Outcome, and description) is a single block quote.
+- The recommendation MUST start with a single capitalized action word followed by a period, then the rationale: **Fix.**, **Ignore.**, or **Follow-up.**
+- Every `###` finding title and its corresponding summary table row start with a status emoji: ◯ (no outcome), 🟣 (in progress/elaborate), 🟡 (ignored), 🟢 (done/fixed). Initially all are ◯.
+- Add `<br>` between findings within the same `##` section (between the end of one block quote and the next `###` heading).
 - The description paragraph starts with a backtick-wrapped `file:line` reference.
-- The `<!-- @actions: elaborate, fix -->` comment goes on the `###` heading line itself (e.g., `### Finding title <!-- @actions: elaborate, fix -->`), so md-annotate attaches the action buttons to the heading.
-- If no findings for a section, write "No issues found." with no subsections (no `@actions` comment for empty sections).
+- The `<!-- @actions: elaborate, fix, ignore -->` comment goes on the `###` heading line itself (e.g., `### ◯ Finding title <!-- @actions: elaborate, fix, ignore -->`).
+- If no findings for a section, write "No issues found." with no subsections (no `@actions` comment).
 - Omit the Multiplayer section if the PR doesn't touch multiplayer code.
 - Omit the Go Style section if the PR doesn't touch Go code.
 
@@ -365,7 +386,7 @@ Rules:
 After writing the file:
 
 1. Run `md-annotate open review.md` to open the annotation UI in the browser.
-2. Tell the user: "Review written to `review.md` and opened in md-annotate. Click **Elaborate** or **Fix** on any finding, or ask me questions about the PR."
+2. Tell the user: "Review written to `review.md` and opened in md-annotate. Click **Elaborate**, **Fix**, or **Ignore** on any finding, or ask me questions about the PR."
 
 ### Handling md-annotate actions
 
@@ -373,9 +394,19 @@ Wait for `[md-annotate]` messages. When one arrives:
 
 1. Run `md-annotate next` to get the next pending annotation.
 2. Based on the action:
-   - **Elaborate**: Provide a deeper explanation of the finding. Include code examples, explain why it matters, reference the specific code in the diff, and describe what could go wrong. Use `md-annotate reply <id> "text"` to respond.
-   - **Fix**: Make the fix in the codebase. Then use `md-annotate reply --resolve <id> "text"` to reply with what was changed. Do NOT push the commit.
+   - **Elaborate**: Provide a deeper explanation of the finding. Include code examples, explain why it matters, reference the specific code in the diff, and describe what could go wrong. Use `md-annotate reply <id> "text"` to respond. Update the document (see checklist below).
+   - **Fix**: Make the fix in the codebase. Use `md-annotate reply --resolve <id> "text"` to reply with what was changed. Update the document (see checklist below). Do NOT push the commit.
+   - **Ignore**: Use `md-annotate reply --resolve <id> "Ignored."` to resolve. Update the document (see checklist below).
 3. After replying, run `md-annotate next` again to check for more pending annotations.
+
+### Document update checklist
+
+**After EVERY outcome change**, update ALL of the following. Do not skip any:
+
+1. **`###` title emoji**: ◯ → 🟣 (elaborate/in-progress), 🟡 (ignored), or 🟢 (done)
+2. **`**Outcome:**`** in the block quote: `N/A` → `Done` or `Ignored`
+3. **Summary table row emoji**: same emoji as the `###` title
+4. **Summary table Outcome column**: `N/A` → `Done` or `Ignored`
 
 ### Handling regular conversation
 
