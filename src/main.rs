@@ -893,22 +893,59 @@ fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf
 
     // Try to reuse an idle scratch worktree
     if let Some(reusable) = find_reusable_worktree(&repo_root)? {
-        let dir_name = reusable.file_name().unwrap().to_string_lossy().to_string();
-        let workspace_name = dir_name.strip_prefix("branch-").unwrap_or(&dir_name);
+        let workspace_name = generate_workspace_name();
+        let branch_name = format!("darren/{}", workspace_name);
+
+        let old_dir = reusable.file_name().unwrap().to_string_lossy().to_string();
+        let old_name = old_dir.strip_prefix("branch-").unwrap_or(&old_dir);
 
         println!(
-            "{} Recycling idle workspace {}",
+            "{} Recycling idle workspace {} {} {}",
             "→".blue().bold(),
+            old_name.dimmed(),
+            "→".dimmed(),
             workspace_name.cyan()
         );
 
         reset_worktree_to_master(&reusable)?;
 
+        // Create a new branch for this workspace
+        let status = Command::new("git")
+            .args(["-C", &reusable.to_string_lossy(), "checkout", "-b", &branch_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("Failed to create branch: {}", e))?;
+        if !status.success() {
+            return Err(format!("Failed to create branch {}", branch_name));
+        }
+
+        // Rename the worktree directory to match the new workspace name
+        let new_path = reusable.parent().unwrap().join(format!("branch-{}", workspace_name));
+        let status = Command::new("git")
+            .args([
+                "-C", &repo_root.to_string_lossy(),
+                "worktree", "move",
+                &reusable.to_string_lossy(),
+                &new_path.to_string_lossy(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("Failed to rename worktree: {}", e))?;
+        if !status.success() {
+            return Err(format!(
+                "Failed to rename worktree from {} to {}",
+                reusable.display(),
+                new_path.display()
+            ));
+        }
+
         println!();
         println!(
             "{} Worktree ready at {}",
             "✓".green().bold(),
-            reusable.display().to_string().cyan().bold()
+            new_path.display().to_string().cyan().bold()
         );
 
         if no_claude {
@@ -916,14 +953,13 @@ fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf
                 "\n{} Run: {} {} {}",
                 "tip:".yellow().bold(),
                 "cd".dimmed(),
-                reusable.display(),
+                new_path.display(),
                 "&& claude".dimmed()
             );
         } else {
-            let bg_color = pick_available_color(&reusable);
-            save_worktree_color(&reusable, &bg_color)?;
+            let bg_color = pick_available_color(&new_path);
+            save_worktree_color(&new_path, &bg_color)?;
 
-            let branch_name = format!("darren/{}", workspace_name);
             let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
 
             let system_prompt = build_worktree_system_prompt();
@@ -938,9 +974,9 @@ fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf
             if let Some(prompt_path) = claude_prompt {
                 let content = fs::read_to_string(&prompt_path)
                     .map_err(|e| format!("Failed to read prompt file {}: {}", prompt_path.display(), e))?;
-                spawn_claude_with_prompt(&reusable, &content, Some(&system_prompt))?;
+                spawn_claude_with_prompt(&new_path, &content, Some(&system_prompt))?;
             } else {
-                spawn_claude(&reusable, Some(&system_prompt))?;
+                spawn_claude(&new_path, Some(&system_prompt))?;
             }
         }
 
@@ -1042,7 +1078,11 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
         .map(|(((path, branch), child), has_active_session)| {
             let has_changes = child
                 .and_then(|c| c.wait_with_output().ok())
-                .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+                .map(|o| {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    // Only count tracked-file changes, not untracked files (??)
+                    stdout.lines().any(|l| !l.trim().is_empty() && !l.starts_with("??"))
+                })
                 .unwrap_or(false);
             let orphaned_pids: Vec<u32> = Vec::new();
             WorktreeInfo { path, branch, has_changes, has_active_session, orphaned_pids }
@@ -1525,29 +1565,47 @@ fn prompt_existing_worktree_action(
                     .join()
                     .map_err(|_| "Failed to check git status".to_string())??;
                 if let Some(changes) = status {
-                    println!();
-                    println!(
-                        "{} Worktree has uncommitted changes:",
-                        "!".yellow().bold()
-                    );
-                    for line in changes.lines() {
-                        println!("  {}", line.dimmed());
+                    // Separate tracked changes from untracked files
+                    let tracked: Vec<&str> = changes.lines().filter(|l| !l.starts_with("??")).collect();
+                    let untracked: Vec<&str> = changes.lines().filter(|l| l.starts_with("??")).collect();
+
+                    if !untracked.is_empty() {
+                        println!();
+                        println!(
+                            "{} Worktree has untracked files {}:",
+                            "!".yellow().bold(),
+                            "(will be kept)".dimmed()
+                        );
+                        for line in &untracked {
+                            println!("  {}", line.dimmed());
+                        }
                     }
-                    println!();
-                    print!(
-                        "{} Discard these changes? [y/N]: ",
-                        "!".yellow().bold()
-                    );
-                    io::stdout().flush().map_err(|e| e.to_string())?;
 
-                    let mut confirm = String::new();
-                    io::stdin()
-                        .read_line(&mut confirm)
-                        .map_err(|e| format!("Failed to read input: {}", e))?;
+                    if !tracked.is_empty() {
+                        println!();
+                        println!(
+                            "{} Worktree has uncommitted changes:",
+                            "!".yellow().bold()
+                        );
+                        for line in &tracked {
+                            println!("  {}", line.dimmed());
+                        }
+                        println!();
+                        print!(
+                            "{} Discard these changes? [y/N]: ",
+                            "!".yellow().bold()
+                        );
+                        io::stdout().flush().map_err(|e| e.to_string())?;
 
-                    if confirm.trim().to_lowercase() != "y" {
-                        println!("{} Cancelled", "→".blue().bold());
-                        std::process::exit(0);
+                        let mut confirm = String::new();
+                        io::stdin()
+                            .read_line(&mut confirm)
+                            .map_err(|e| format!("Failed to read input: {}", e))?;
+
+                        if confirm.trim().to_lowercase() != "y" {
+                            println!("{} Cancelled", "→".blue().bold());
+                            std::process::exit(0);
+                        }
                     }
                 }
                 return Ok(ExistingWorktreeAction::UseExisting);
