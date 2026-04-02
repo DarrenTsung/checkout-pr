@@ -395,7 +395,7 @@ Wait for `[md-annotate]` messages. When one arrives:
 1. Run `md-annotate next` to get the next pending annotation.
 2. Based on the action:
    - **Elaborate**: Provide a deeper explanation of the finding. Include code examples, explain why it matters, reference the specific code in the diff, and describe what could go wrong. Use `md-annotate reply <id> "text"` to respond. Update the document (see checklist below).
-   - **Fix**: Make the fix in the codebase. Use `md-annotate reply --resolve <id> "text"` to reply with what was changed. Update the document (see checklist below). Do NOT push the commit.
+   - **Fix**: Make the fix in the codebase. Commit and push immediately (`git add <files> && git commit -m "..." && git push`). Use `md-annotate reply --resolve <id> "Done in <short_sha>"` to reply with the commit SHA. Update the document (see checklist below).
    - **Ignore**: Use `md-annotate reply --resolve <id> "Ignored."` to resolve. Update the document (see checklist below).
 3. After replying, run `md-annotate next` again to check for more pending annotations.
 
@@ -404,9 +404,9 @@ Wait for `[md-annotate]` messages. When one arrives:
 **After EVERY outcome change**, update ALL of the following. Do not skip any:
 
 1. **`###` title emoji**: ◯ → 🟣 (elaborate/in-progress), 🟡 (ignored), or 🟢 (done)
-2. **`**Outcome:**`** in the block quote: `N/A` → `Done` or `Ignored`
+2. **`**Outcome:**`** in the block quote: `N/A` → `Done in <short_sha> ([commit](https://github.com/figma/figma/commit/<full_sha>))` or `Ignored`
 3. **Summary table row emoji**: same emoji as the `###` title
-4. **Summary table Outcome column**: `N/A` → `Done` or `Ignored`
+4. **Summary table Outcome column**: `N/A` → `Done in <short_sha>` or `Ignored`
 
 ### Handling regular conversation
 
@@ -418,7 +418,7 @@ Also respond to regular conversation messages (not from md-annotate). When answe
 - When linking to files, use paths relative to the current directory (e.g., `multiplayer/lib/rust_process.ts:2465`)
 - When providing a local path, also remind the user: "To compare against the base branch (`<baseRefName>`), use `Cmd+Shift+G M` → GitLens: Open Changes with Branch"
 
-When resolving comments, please DO NOT push the commit until approval by the user.
+When fixing review findings, commit and push each fix immediately. Each fix should be its own commit with a descriptive message.
 
 Replying to PR review comments:
 - When the user asks you to reply to a review comment, use: `gh api -X POST repos/figma/figma/pulls/<PR_NUMBER>/comments -F body="<your_reply>" -F in_reply_to=<COMMENT_ID>`
