@@ -521,10 +521,12 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
     let worktree_dir = default_worktree_dir();
     let worktree_path = worktree_dir.join(format!("pr-{}-{}", pr_number, slug));
 
-    // Check for an existing worktree by branch name first (from `checkout branch`), then PR prefix
+    // Check for an existing worktree by branch name first (from `checkout branch`), then PR prefix,
+    // then by checked-out branch (covers `checkout new` worktrees with random names)
     let branch_slug = pr_details.head_ref_name.rsplit('/').next().unwrap_or(&pr_details.head_ref_name);
     let existing = find_existing_worktree(&repo_root, &format!("branch-{}", branch_slug))?
-        .or(find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?);
+        .or(find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?)
+        .or(find_existing_worktree(&repo_root, &format!("[{}]", pr_details.head_ref_name))?);
 
     let mut resume = false;
     let mut is_new_worktree = false;
@@ -1001,8 +1003,41 @@ struct WorktreeInfo {
     path: PathBuf,
     branch: String,
     has_changes: bool,
+    /// Worktree has only untracked files that match known tool-artifact patterns
+    /// (review.md, walkthroughs, eval results, etc.). Safe to force-remove without
+    /// individual prompting.
+    has_only_safe_untracked: bool,
     has_active_session: bool,
     orphaned_pids: Vec<u32>,
+}
+
+/// Returns true if a filename from `git status --porcelain` is a known
+/// tool artifact that is safe to discard when cleaning worktrees.
+fn is_safe_untracked_file(name: &str) -> bool {
+    // Strip trailing slash for directory entries
+    let name = name.trim_end_matches('/');
+
+    // Exact matches
+    if name == "review.md" {
+        return true;
+    }
+
+    // Glob-style suffix/prefix checks
+    if name.ends_with(".annotations.json") { return true; }
+    if name.starts_with("walkthrough-") && (name.ends_with(".html") || name.ends_with(".md")) {
+        return true;
+    }
+    if name.ends_with("_results.json") || name.ends_with("_summary.txt") {
+        return true;
+    }
+    if name.starts_with("investigation-") || name.starts_with("flaky-") {
+        return true;
+    }
+    if name.starts_with("dd-widget-") && name.ends_with(".png") {
+        return true;
+    }
+
+    false
 }
 
 fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
@@ -1076,16 +1111,25 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
         .zip(children)
         .zip(session_status)
         .map(|(((path, branch), child), has_active_session)| {
-            let has_changes = child
+            let (has_changes, has_only_safe_untracked) = child
                 .and_then(|c| c.wait_with_output().ok())
                 .map(|o| {
                     let stdout = String::from_utf8_lossy(&o.stdout);
-                    // Only count tracked-file changes, not untracked files (??)
-                    stdout.lines().any(|l| !l.trim().is_empty() && !l.starts_with("??"))
+                    let lines: Vec<&str> = stdout.lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .collect();
+                    let has_tracked_changes = lines.iter().any(|l| !l.starts_with("??"));
+                    let untracked: Vec<&str> = lines.iter()
+                        .filter(|l| l.starts_with("?? "))
+                        .map(|l| l.trim_start_matches("?? ").trim())
+                        .collect();
+                    let all_untracked_safe = !untracked.is_empty()
+                        && untracked.iter().all(|f| is_safe_untracked_file(f));
+                    (has_tracked_changes, !has_tracked_changes && all_untracked_safe)
                 })
-                .unwrap_or(false);
+                .unwrap_or((false, false));
             let orphaned_pids: Vec<u32> = Vec::new();
-            WorktreeInfo { path, branch, has_changes, has_active_session, orphaned_pids }
+            WorktreeInfo { path, branch, has_changes, has_only_safe_untracked, has_active_session, orphaned_pids }
         })
         .collect();
 
@@ -1173,11 +1217,10 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
         print!("{} Removing {}... ", "→".blue().bold(), dir_name.cyan());
         std::io::stdout().flush().ok();
 
-        // Force-remove for worktrees with uncommitted changes
         let repo_str = repo_root.to_string_lossy();
         let wt_str = wt.path.to_string_lossy();
         let mut args = vec!["-C", &repo_str, "worktree", "remove"];
-        if wt.has_changes {
+        if wt.has_changes || wt.has_only_safe_untracked {
             args.push("--force");
         }
         args.push(&wt_str);
@@ -2413,6 +2456,7 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
                 path,
                 branch,
                 has_changes: false,
+                has_only_safe_untracked: false,
                 has_active_session: false,
                 orphaned_pids: Vec::new(),
             };
