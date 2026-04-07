@@ -177,6 +177,12 @@ enum Commands {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Create a new worktree and start with /darren:workstream-begin
+    Begin {
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// List all worktrees and their status
     Status {
         /// Path to the repo (default: $CHECKOUT_REPO)
@@ -477,12 +483,30 @@ fn run() -> Result<(), String> {
         Commands::Pr { pr, no_claude, repo, skill } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", skill.as_deref()),
         Commands::Walkthrough { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", Some("/walkthrough")),
         Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-and-review-pr", None),
-        Commands::Branch { name, no_claude, claude_prompt, repo } => run_branch(&name, no_claude, claude_prompt, repo),
-        Commands::New { no_claude, claude_prompt, repo } => run_new(no_claude, claude_prompt, repo),
+        Commands::Branch { name, no_claude, claude_prompt, repo } => {
+            let prompt = read_prompt_file(claude_prompt)?;
+            run_branch(&name, no_claude, prompt, repo)
+        },
+        Commands::New { no_claude, claude_prompt, repo } => {
+            let prompt = read_prompt_file(claude_prompt)?;
+            run_new(no_claude, prompt, repo)
+        },
+        Commands::Begin { repo } => run_new(false, Some("/darren:workstream-begin multiworkspace".to_string()), repo),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
         Commands::Resume { repo } => run_resume(repo),
         Commands::ResumeLast { repo } => run_resume_last(repo),
+    }
+}
+
+fn read_prompt_file(path: Option<PathBuf>) -> Result<Option<String>, String> {
+    match path {
+        Some(p) => {
+            let content = fs::read_to_string(&p)
+                .map_err(|e| format!("Failed to read prompt file {}: {}", p.display(), e))?;
+            Ok(Some(content))
+        }
+        None => Ok(None),
     }
 }
 
@@ -633,7 +657,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
     Ok(())
 }
 
-fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf>) -> Result<(), String> {
+fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<String>, repo: Option<PathBuf>) -> Result<(), String> {
     timing!("run_branch");
     let branch_name = name.to_string();
 
@@ -735,14 +759,6 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
             println!();
             spawn_claude_continue(&final_path, Some(&system_prompt))?;
         } else {
-            let prompt = if let Some(prompt_path) = claude_prompt {
-                let content = fs::read_to_string(&prompt_path)
-                    .map_err(|e| format!("Failed to read prompt file {}: {}", prompt_path.display(), e))?;
-                Some(content)
-            } else {
-                None
-            };
-
             println!();
             println!(
                 "{} Spawning claude...",
@@ -750,7 +766,7 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<PathBuf>, repo:
             );
             println!();
 
-            if let Some(prompt) = &prompt {
+            if let Some(prompt) = &claude_prompt {
                 spawn_claude_with_prompt(&final_path, prompt, Some(&system_prompt))?;
             } else {
                 spawn_claude(&final_path, Some(&system_prompt))?;
@@ -925,7 +941,7 @@ fn reset_worktree_to_master(worktree_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf>) -> Result<(), String> {
+fn run_new(no_claude: bool, claude_prompt: Option<String>, repo: Option<PathBuf>) -> Result<(), String> {
     timing!("run_new");
     let repo_root = repo.clone().unwrap_or_else(default_repo_root);
 
@@ -1024,10 +1040,8 @@ fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf
             );
             println!();
 
-            if let Some(prompt_path) = claude_prompt {
-                let content = fs::read_to_string(&prompt_path)
-                    .map_err(|e| format!("Failed to read prompt file {}: {}", prompt_path.display(), e))?;
-                spawn_claude_with_prompt(&new_path, &content, Some(&system_prompt))?;
+            if let Some(prompt) = &claude_prompt {
+                spawn_claude_with_prompt(&new_path, prompt, Some(&system_prompt))?;
             } else {
                 spawn_claude(&new_path, Some(&system_prompt))?;
             }
@@ -1985,7 +1999,7 @@ fn which_mise() -> Option<PathBuf> {
 
 fn run_mise_trust(worktree_path: &PathBuf) -> Result<(), String> {
     let status = Command::new("mise")
-        .args(["trust"])
+        .args(["trust", "--all"])
         .current_dir(worktree_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
