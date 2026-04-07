@@ -2016,8 +2016,9 @@ fn run_mise_trust(worktree_path: &PathBuf) -> Result<(), String> {
 fn run_gt_track(worktree_path: &PathBuf) -> Result<(), String> {
     timing!("run_gt_track");
     let status = Command::new("gt")
-        .args(["track", "--no-interactive"])
+        .args(["track", "--no-interactive", "--parent", "master"])
         .current_dir(worktree_path)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
