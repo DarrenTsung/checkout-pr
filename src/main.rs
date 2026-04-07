@@ -770,6 +770,19 @@ const ADJECTIVES: &[&str] = &[
     "keen", "lush", "mild", "neat", "open", "pure", "quick", "rare",
     "sage", "tame", "vast", "warm", "zesty", "brave", "crisp", "dense",
     "fond", "grim", "hazy", "idle", "just", "kind", "lean", "mute",
+    "agile", "apt", "arid", "ashen", "avid", "blunt", "brisk", "coral",
+    "coy", "damp", "dim", "dry", "dusky", "elfin", "even", "faint",
+    "fell", "firm", "flat", "fleet", "flush", "frail", "fresh", "frost",
+    "full", "gaunt", "glib", "gold", "grand", "gray", "green", "gruff",
+    "gusty", "hardy", "hazel", "hex", "high", "hoary", "hush", "icy",
+    "inky", "ivory", "jet", "jolly", "lax", "light", "lithe", "live",
+    "lone", "lucid", "lunar", "meek", "misty", "mossy", "new", "numb",
+    "oaken", "opal", "pale", "peak", "plaid", "plum", "polar", "proud",
+    "quiet", "rapid", "raw", "regal", "rigid", "rocky", "rosy", "rough",
+    "rusty", "sandy", "sharp", "sheer", "shy", "silky", "slim", "snowy",
+    "solar", "solid", "spare", "stark", "steep", "still", "stony", "stout",
+    "swift", "terse", "thin", "tidal", "tiny", "trim", "true", "twin",
+    "vivid", "wary", "wavy", "white", "whole", "wide", "wild", "wiry",
 ];
 
 const NOUNS: &[&str] = &[
@@ -777,17 +790,44 @@ const NOUNS: &[&str] = &[
     "jade", "knoll", "lark", "moss", "nova", "oak", "pine", "quartz",
     "reef", "slate", "thorn", "vale", "wren", "birch", "cliff", "delta",
     "fern", "glade", "hawk", "isle", "junco", "kelp", "lynx", "marsh",
+    "alder", "amber", "anvil", "aspen", "basil", "bay", "blaze", "bloom",
+    "bolt", "brine", "cairn", "cave", "clam", "cloud", "coal", "colt",
+    "cone", "coral", "cove", "crane", "creek", "crest", "crow", "dale",
+    "dawn", "doe", "dove", "drift", "dusk", "ember", "finch", "fjord",
+    "flame", "flax", "foam", "fog", "forge", "fox", "frost", "gale",
+    "gem", "glen", "glow", "goose", "grain", "hare", "hazel", "heath",
+    "hedge", "herb", "hive", "holly", "inlet", "ivy", "jay", "kite",
+    "lake", "larch", "leaf", "ledge", "lily", "lime", "lodge", "maple",
+    "mesa", "mink", "mint", "mist", "moon", "moor", "moth", "nectar",
+    "nest", "oat", "olive", "orca", "otter", "owl", "pear", "plum",
+    "pond", "poppy", "rain", "ridge", "robin", "root", "rose", "rush",
+    "sage", "seal", "seed", "shade", "shell", "shore", "shrub", "smoke",
+    "snow", "spark", "spire", "spruce", "star", "stem", "stone", "storm",
+    "stork", "swift", "thyme", "tide", "trail", "trout", "tulip", "vine",
+    "wave", "wheat", "willow", "wolf", "yew",
 ];
 
-fn generate_workspace_name() -> String {
+fn generate_workspace_name(existing: &HashSet<String>) -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos() as usize;
 
+    let total = ADJECTIVES.len() * NOUNS.len();
+    for offset in 0..total {
+        let idx = (nanos + offset) % total;
+        let adj = ADJECTIVES[idx % ADJECTIVES.len()];
+        let noun = NOUNS[idx / ADJECTIVES.len()];
+        let name = format!("{}-{}", adj, noun);
+        if !existing.contains(&name) {
+            return name;
+        }
+    }
+
+    // Fallback: all names taken (very unlikely), append timestamp
     let adj = ADJECTIVES[nanos % ADJECTIVES.len()];
     let noun = NOUNS[(nanos / ADJECTIVES.len()) % NOUNS.len()];
-    format!("{}-{}", adj, noun)
+    format!("{}-{}-{}", adj, noun, nanos)
 }
 
 /// Check if a worktree directory name matches the adjective-noun pattern from `checkout new`.
@@ -893,9 +933,20 @@ fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf
         return Err(format!("Repo not found at {}", repo_root.display()));
     }
 
+    // Collect existing worktree names so we don't generate a collision
+    let existing_names: HashSet<String> = list_worktree_paths(&repo_root)?
+        .iter()
+        .filter_map(|(path, _)| {
+            path.file_name()
+                .and_then(|f| f.to_str())
+                .and_then(|s| s.strip_prefix("branch-"))
+                .map(|s| s.to_string())
+        })
+        .collect();
+
     // Try to reuse an idle scratch worktree
     if let Some(reusable) = find_reusable_worktree(&repo_root)? {
-        let workspace_name = generate_workspace_name();
+        let workspace_name = generate_workspace_name(&existing_names);
         let branch_name = format!("darren/{}", workspace_name);
 
         let old_dir = reusable.file_name().unwrap().to_string_lossy().to_string();
@@ -986,7 +1037,7 @@ fn run_new(no_claude: bool, claude_prompt: Option<PathBuf>, repo: Option<PathBuf
     }
 
     // No reusable worktree, create a new one
-    let workspace_name = generate_workspace_name();
+    let workspace_name = generate_workspace_name(&existing_names);
     let branch_name = format!("darren/{}", workspace_name);
 
     println!(
