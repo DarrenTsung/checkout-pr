@@ -319,62 +319,47 @@ Write `review.md` to the worktree root with this structure:
 | 1 | ◯ <short description> | N/A |
 | 2 | ◯ ... | N/A |
 
-## Correctness
+## Fix
 
 ### ◯ <Concise finding title> <!-- @actions: elaborate, fix, ignore -->
 
-> **Recommendation:** <Fix. / Ignore. / Follow-up.> <rationale>
->
 > **Outcome:** N/A
 >
-> `path/to/file.ts:123` - <description of the issue>
+> [Correctness] `path/to/file.ts:123` - <description of the issue>
 
 <br>
 
 ### ◯ <Another finding> <!-- @actions: elaborate, fix, ignore -->
 
-> **Recommendation:** <Fix. / Ignore. / Follow-up.> <rationale>
->
 > **Outcome:** N/A
 >
-> `path/to/file.ts:456` - <description>
+> [Risks] `path/to/file.ts:456` - <description>
 
-## Test Coverage
-### ...
+## Follow-up
 
-## Test Readability
-### ...
+### ◯ <Finding title> <!-- @actions: elaborate, fix, ignore -->
 
-## Test Timing
-### ...
+> **Outcome:** N/A
+>
+> [Test Timing] `path/to/file.ts:789` - <description>
 
-## Test Value
-### ...
+## Ignore
 
-## Coherence
-### ...
+### ◯ <Finding title> <!-- @actions: elaborate, fix, ignore -->
 
-## Risks
-### ...
-
-## Multiplayer
-### ...
-
-## Go Style
-### ...
+> **Outcome:** N/A
+>
+> [Coherence] `path/to/file.ts:101` - <description>
 ```
 
 Rules:
-- Each reviewer section is an `##` heading. Each finding is a `###` subsection.
-- The finding body (Recommendation, Outcome, and description) is a single block quote.
-- The recommendation MUST start with a single capitalized action word followed by a period, then the rationale: **Fix.**, **Ignore.**, or **Follow-up.**
+- The three `##` headings are **Fix**, **Follow-up**, and **Ignore**. Each finding is a `###` subsection under the appropriate recommendation heading.
+- Each finding's description starts with the reviewer category in brackets (e.g., `[Correctness]`, `[Risks]`, `[Go Style]`), followed by a backtick-wrapped `file:line` reference and description.
+- The finding body (Outcome and description) is a single block quote.
 - Every `###` finding title and its corresponding summary table row start with a status emoji: ◯ (no outcome), 🟣 (in progress/elaborate), 🟡 (ignored), 🟢 (done/fixed). Initially all are ◯.
 - Add `<br>` between findings within the same `##` section (between the end of one block quote and the next `###` heading).
-- The description paragraph starts with a backtick-wrapped `file:line` reference.
 - The `<!-- @actions: elaborate, fix, ignore -->` comment goes on the `###` heading line itself (e.g., `### ◯ Finding title <!-- @actions: elaborate, fix, ignore -->`).
 - Add a numbered summary table at the top with all findings. Outcome is initially `N/A`.
-- If no findings for a section, write "No issues found." with no subsections (no `@actions` comment).
-- Omit the Multiplayer section if the PR doesn't touch multiplayer code.
-- Omit the Go Style section if the PR doesn't touch Go code.
+- If no findings for a recommendation group, omit that `##` section entirely.
 
 After writing the file, tell the user: "Review written to `review.md`."

@@ -19,6 +19,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -39,6 +40,7 @@ const COLOR_PALETTE: &[&str] = &[
 ];
 
 static TIMINGS_ENABLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_WORKTREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 thread_local! {
     static TIMING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -304,6 +306,14 @@ fn setup_ctrlc_handler() {
             reset_iterm_background();
             reset_iterm_title();
         }
+        // Write session exited file so the worktree can be reused later.
+        // PidFileGuard::drop is bypassed by process::exit, so we do it here.
+        if let Ok(guard) = ACTIVE_WORKTREE.lock() {
+            if let Some(path) = guard.as_ref() {
+                remove_session_pid(path);
+                write_session_exited(path);
+            }
+        }
         std::process::exit(130); // Standard exit code for Ctrl+C
     })
     .ok();
@@ -451,6 +461,10 @@ impl PidFileGuard {
         write_session_pid(worktree_path, pid);
         // Clear the exited marker so this worktree isn't considered idle
         let _ = fs::remove_file(session_exited_file(worktree_path));
+        // Register so the ctrlc handler can clean up
+        if let Ok(mut guard) = ACTIVE_WORKTREE.lock() {
+            *guard = Some(worktree_path.to_path_buf());
+        }
         Self {
             worktree_path: worktree_path.to_path_buf(),
         }
@@ -459,6 +473,10 @@ impl PidFileGuard {
 
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
+        // Clear the global first so ctrlc handler won't double-write
+        if let Ok(mut guard) = ACTIVE_WORKTREE.lock() {
+            *guard = None;
+        }
         remove_session_pid(&self.worktree_path);
         write_session_exited(&self.worktree_path);
     }
@@ -1068,41 +1086,8 @@ struct WorktreeInfo {
     path: PathBuf,
     branch: String,
     has_changes: bool,
-    /// Worktree has only untracked files that match known tool-artifact patterns
-    /// (review.md, walkthroughs, eval results, etc.). Safe to force-remove without
-    /// individual prompting.
-    has_only_safe_untracked: bool,
     has_active_session: bool,
     orphaned_pids: Vec<u32>,
-}
-
-/// Returns true if a filename from `git status --porcelain` is a known
-/// tool artifact that is safe to discard when cleaning worktrees.
-fn is_safe_untracked_file(name: &str) -> bool {
-    // Strip trailing slash for directory entries
-    let name = name.trim_end_matches('/');
-
-    // Exact matches
-    if name == "review.md" {
-        return true;
-    }
-
-    // Glob-style suffix/prefix checks
-    if name.ends_with(".annotations.json") { return true; }
-    if name.starts_with("walkthrough-") && (name.ends_with(".html") || name.ends_with(".md")) {
-        return true;
-    }
-    if name.ends_with("_results.json") || name.ends_with("_summary.txt") {
-        return true;
-    }
-    if name.starts_with("investigation-") || name.starts_with("flaky-") {
-        return true;
-    }
-    if name.starts_with("dd-widget-") && name.ends_with(".png") {
-        return true;
-    }
-
-    false
 }
 
 fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
@@ -1176,25 +1161,15 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
         .zip(children)
         .zip(session_status)
         .map(|(((path, branch), child), has_active_session)| {
-            let (has_changes, has_only_safe_untracked) = child
+            let has_changes = child
                 .and_then(|c| c.wait_with_output().ok())
                 .map(|o| {
                     let stdout = String::from_utf8_lossy(&o.stdout);
-                    let lines: Vec<&str> = stdout.lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .collect();
-                    let has_tracked_changes = lines.iter().any(|l| !l.starts_with("??"));
-                    let untracked: Vec<&str> = lines.iter()
-                        .filter(|l| l.starts_with("?? "))
-                        .map(|l| l.trim_start_matches("?? ").trim())
-                        .collect();
-                    let all_untracked_safe = !untracked.is_empty()
-                        && untracked.iter().all(|f| is_safe_untracked_file(f));
-                    (has_tracked_changes, !has_tracked_changes && all_untracked_safe)
+                    stdout.lines().any(|l| !l.trim().is_empty() && !l.starts_with("??"))
                 })
-                .unwrap_or((false, false));
+                .unwrap_or(false);
             let orphaned_pids: Vec<u32> = Vec::new();
-            WorktreeInfo { path, branch, has_changes, has_only_safe_untracked, has_active_session, orphaned_pids }
+            WorktreeInfo { path, branch, has_changes, has_active_session, orphaned_pids }
         })
         .collect();
 
@@ -1284,11 +1259,10 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
 
         let repo_str = repo_root.to_string_lossy();
         let wt_str = wt.path.to_string_lossy();
-        let mut args = vec!["-C", &repo_str, "worktree", "remove"];
-        if wt.has_changes || wt.has_only_safe_untracked {
-            args.push("--force");
-        }
-        args.push(&wt_str);
+        // Always --force: the caller has already confirmed removal, and without
+        // it git refuses to delete directories containing gitignored files
+        // (e.g. .DS_Store, build artifacts) even though they show as "clean".
+        let args = vec!["-C", &repo_str, "worktree", "remove", "--force", &wt_str];
 
         let output = Command::new("git")
             .args(&args)
@@ -1354,14 +1328,40 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
     let modified_worktrees: Vec<_> = worktrees.iter().filter(|w| w.has_changes && !w.has_active_session).collect();
     let active_worktrees: Vec<_> = worktrees.iter().filter(|w| w.has_active_session).collect();
 
-    if !removable_worktrees.is_empty() {
+    // Among removable worktrees, keep the N most recently exited reusable ones
+    // so `checkout begin` can reuse them instead of creating new worktrees.
+    const REUSABLE_POOL_SIZE: usize = 5;
+
+    let kept_for_reuse: HashSet<PathBuf> = {
+        let mut reusable: Vec<(u64, &PathBuf)> = removable_worktrees.iter()
+            .filter(|w| {
+                let dir_name = w.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                is_checkout_new_worktree(dir_name)
+            })
+            .map(|w| {
+                let ts = fs::read_to_string(session_exited_file(&w.path))
+                    .ok()
+                    .and_then(|c| c.lines().next().and_then(|l| l.trim().parse::<u64>().ok()))
+                    .unwrap_or(0);
+                (ts, &w.path)
+            })
+            .collect();
+        // Most recent exits first
+        reusable.sort_by(|a, b| b.0.cmp(&a.0));
+        reusable.into_iter().take(REUSABLE_POOL_SIZE).map(|(_, p)| p.clone()).collect()
+    };
+
+    let actually_removing: Vec<_> = removable_worktrees.iter().filter(|w| !kept_for_reuse.contains(&w.path)).collect();
+    let kept_worktrees: Vec<_> = removable_worktrees.iter().filter(|w| kept_for_reuse.contains(&w.path)).collect();
+
+    if !actually_removing.is_empty() {
         println!(
             "{} Removing {} worktree(s):\n",
             "→".blue().bold(),
-            removable_worktrees.len()
+            actually_removing.len()
         );
 
-        for wt in &removable_worktrees {
+        for wt in &actually_removing {
             let dir_name = wt.path.file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| wt.path.display().to_string());
@@ -1387,8 +1387,32 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         }
     }
 
+    if !kept_worktrees.is_empty() {
+        if !actually_removing.is_empty() {
+            println!();
+        }
+        println!(
+            "{} Keeping {} worktree(s) for reuse:\n",
+            "→".blue().bold(),
+            kept_worktrees.len()
+        );
+
+        for wt in &kept_worktrees {
+            let dir_name = wt.path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| wt.path.display().to_string());
+
+            println!(
+                "  {} {} {}",
+                format!("[{}]", "reuse".green().bold()),
+                dir_name.cyan(),
+                format!("({})", wt.branch).dimmed()
+            );
+        }
+    }
+
     if !active_worktrees.is_empty() {
-        if !removable_worktrees.is_empty() {
+        if !actually_removing.is_empty() || !kept_worktrees.is_empty() {
             println!();
         }
         println!(
@@ -1412,7 +1436,7 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
     }
 
     if !modified_worktrees.is_empty() {
-        if !removable_worktrees.is_empty() || !active_worktrees.is_empty() {
+        if !actually_removing.is_empty() || !kept_worktrees.is_empty() || !active_worktrees.is_empty() {
             println!();
         }
         println!(
@@ -1435,9 +1459,9 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         }
     }
 
-    // Partition into owned vecs before we need them for removal
+    // Partition into owned vecs for removal, excluding those kept for reuse
     let (removable, modified): (Vec<_>, Vec<_>) = worktrees.into_iter()
-        .filter(|w| !w.has_active_session)
+        .filter(|w| !w.has_active_session && !kept_for_reuse.contains(&w.path))
         .partition(|w| !w.has_changes);
 
     if removable.is_empty() && modified.is_empty() {
@@ -2522,7 +2546,6 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
                 path,
                 branch,
                 has_changes: false,
-                has_only_safe_untracked: false,
                 has_active_session: false,
                 orphaned_pids: Vec::new(),
             };
