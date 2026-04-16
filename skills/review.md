@@ -54,7 +54,7 @@ Spawn a teammate with this prompt:
 >
 > If you are not certain an issue is real, do not flag it. False positives erode trust.
 >
-> Output a list of issues found. For each issue, include the file path relative to the working directory with line number (e.g., src/file.ts:123) and description. If no issues, output "No correctness issues found."
+> Output a list of issues found. For each issue, include the file path relative to the working directory with line number (e.g., src/file.ts:123) and description. For each finding, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If no issues, output "No correctness issues found."
 
 ### Teammate 2: Test Coverage Reviewer
 
@@ -76,7 +76,7 @@ Spawn a teammate with this prompt:
 > - Over-testing suggestions (testing implementation details)
 > - Coverage gaps where the code path is already exercised by existing tests, even if with a different input variant
 >
-> Output a list of coverage gaps. For each gap, include the file path relative to the working directory with line number (e.g., src/file.ts:123) and describe what test is needed. If coverage is adequate, output "Test coverage is adequate."
+> Output a list of coverage gaps. For each gap, include the file path relative to the working directory with line number (e.g., src/file.ts:123) and describe what test is needed. For each gap, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If coverage is adequate, output "Test coverage is adequate."
 
 ### Teammate 3: Test Readability Reviewer
 
@@ -104,7 +104,7 @@ Spawn a teammate with this prompt:
 > - Minor style preferences
 > - Tests that are already clear
 >
-> Output specific suggestions for improving test readability. For each issue, include the file path relative to the working directory with line number (e.g., src/file.test.ts:123). If tests are readable, output "Test readability is good."
+> Output specific suggestions for improving test readability. For each issue, include the file path relative to the working directory with line number (e.g., src/file.test.ts:123). For each suggestion, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If tests are readable, output "Test readability is good."
 
 ### Teammate 4: Test Timing Reviewer
 
@@ -126,7 +126,7 @@ Spawn a teammate with this prompt:
 >
 > Some sleeps ARE appropriate (e.g., testing timeout behavior, rate limiting). Only flag sleeps that are used as a workaround for proper synchronization.
 >
-> Output each finding with the file path relative to the working directory with line number (e.g., src/test.rs:45), the current sleep pattern, and a suggested alternative approach. If no problematic sleeps found, output "No timing issues found."
+> Output each finding with the file path relative to the working directory with line number (e.g., src/test.rs:45), the current sleep pattern, and a suggested alternative approach. For each finding, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If no problematic sleeps found, output "No timing issues found."
 
 ### Teammate 5: Test Value Reviewer
 
@@ -151,7 +151,7 @@ Spawn a teammate with this prompt:
 > - Integration tests that overlap with unit tests (both have value)
 > - Pre-existing redundant tests not introduced in this PR
 >
-> Output each finding with the file path relative to the working directory with line number (e.g., src/test.rs:45), explain why the test is redundant or low-value, and suggest whether to remove or consolidate. If all tests add value, output "All tests add value."
+> Output each finding with the file path relative to the working directory with line number (e.g., src/test.rs:45), explain why the test is redundant or low-value, and suggest whether to remove or consolidate. For each finding, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If all tests add value, output "All tests add value."
 
 ### Teammate 6: Coherence Reviewer
 
@@ -176,7 +176,7 @@ Spawn a teammate with this prompt:
 > - Pre-existing disabled tests unrelated to this PR
 > - Reasonable scope limitations that are acknowledged in the PR description
 >
-> Output each finding with the file path relative to the working directory with line number (e.g., src/file.ts:123), what the issue is, and why it matters. If the PR is coherent, output "PR implementation is coherent with its stated goals."
+> Output each finding with the file path relative to the working directory with line number (e.g., src/file.ts:123), what the issue is, and why it matters. For each finding, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If the PR is coherent, output "PR implementation is coherent with its stated goals."
 
 ### Teammate 7: Risk Reviewer
 
@@ -208,7 +208,7 @@ Spawn a teammate with this prompt:
 > - Generic concerns without specific connection to code in this PR
 > - Pre-existing risks not introduced or worsened by this PR
 >
-> Output each risk with the file path relative to the working directory with line number (e.g., src/file.ts:123), the assumption being made, and what could go wrong if it's violated. If no significant risks, output "No hidden risks identified."
+> Output each risk with the file path relative to the working directory with line number (e.g., src/file.ts:123), the assumption being made, and what could go wrong if it's violated. For each risk, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If no significant risks, output "No hidden risks identified."
 
 ### Teammate 8: Multiplayer Reviewer (only if multiplayer PR)
 
@@ -237,7 +237,7 @@ Spawn a teammate with this prompt:
 > - Is the new work gated behind a LaunchDarkly feature flag for safe rollout/rollback?
 > - Could the computation be deferred or made async if it's not needed for the response?
 >
-> Output any issues found with file paths relative to the working directory and line numbers (e.g., src/protocol.ts:45 and multiplayer/src/protocol.rs:78). If no issues, output "No multiplayer-specific issues found."
+> Output any issues found with file paths relative to the working directory and line numbers (e.g., src/protocol.ts:45 and multiplayer/src/protocol.rs:78). For each issue, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If no issues, output "No multiplayer-specific issues found."
 
 ### Teammate 9: Go Style Reviewer (only if Go PR)
 
@@ -293,7 +293,7 @@ Spawn a teammate with this prompt:
 > - Pre-existing style violations not introduced by this PR
 > - Minor naming preferences that don't affect clarity
 >
-> Output each finding with the file path relative to the working directory with line number (e.g., go/common/metrics/client.go:45), the pattern violated, and a brief fix suggestion. If no issues, output "Go code follows style guide."
+> Output each finding with the file path relative to the working directory with line number (e.g., go/common/metrics/client.go:45), the pattern violated, and a brief fix suggestion. For each finding, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If no issues, output "Go code follows style guide."
 
 ---
 
@@ -303,7 +303,11 @@ Wait for all teammates to complete their reviews. Then synthesize their findings
 
 **Cross-reference with PR comments:** Before writing each finding, check if it was already acknowledged or discussed in the PR comments you fetched in Phase 1. If the author or a reviewer already called out the issue, append "(Acknowledged by author in PR comments)" to the description.
 
-**Consolidate duplicates:** If multiple teammates flag the same issue, write it once in the most relevant section.
+**Consolidate duplicates:** If multiple teammates flag the same issue, write it once.
+
+**Use reviewer recommendations:** Each reviewer includes a **Recommendation** (Fix, Follow-up, or Ignore, with reasoning) for each of their findings. Carry that recommendation into the output. If multiple reviewers flag the same issue with different recommendations, use your judgment to pick the most appropriate one.
+
+**Order findings** within the `## Findings` section by recommendation: Fix first, then Follow-up, then Ignore. This makes the most actionable items easiest to scan.
 
 Write `review.md` to the worktree root with this structure:
 
@@ -314,15 +318,18 @@ Write `review.md` to the worktree root with this structure:
 
 ## Summary
 
-| # | Finding | Outcome |
-|---|---------|---------|
-| 1 | ◯ <short description> | N/A |
-| 2 | ◯ ... | N/A |
+| # | Finding | Recommendation | Outcome |
+|---|---------|----------------|---------|
+| 1 | ◯ <short description> | Fix | N/A |
+| 2 | ◯ ... | Follow-up | N/A |
+| 3 | ◯ ... | Ignore | N/A |
 
-## Fix
+## Findings
 
 ### ◯ <Concise finding title> <!-- @actions: elaborate, fix, ignore -->
 
+> **Recommendation:** Fix — <brief reasoning>
+>
 > **Outcome:** N/A
 >
 > [Correctness] `path/to/file.ts:123` - <description of the issue>
@@ -331,35 +338,31 @@ Write `review.md` to the worktree root with this structure:
 
 ### ◯ <Another finding> <!-- @actions: elaborate, fix, ignore -->
 
+> **Recommendation:** Follow-up — <brief reasoning>
+>
 > **Outcome:** N/A
 >
 > [Risks] `path/to/file.ts:456` - <description>
 
-## Follow-up
+<br>
 
 ### ◯ <Finding title> <!-- @actions: elaborate, fix, ignore -->
 
-> **Outcome:** N/A
+> **Recommendation:** Ignore — <brief reasoning>
 >
-> [Test Timing] `path/to/file.ts:789` - <description>
-
-## Ignore
-
-### ◯ <Finding title> <!-- @actions: elaborate, fix, ignore -->
-
 > **Outcome:** N/A
 >
 > [Coherence] `path/to/file.ts:101` - <description>
 ```
 
 Rules:
-- The three `##` headings are **Fix**, **Follow-up**, and **Ignore**. Each finding is a `###` subsection under the appropriate recommendation heading.
-- Each finding's description starts with the reviewer category in brackets (e.g., `[Correctness]`, `[Risks]`, `[Go Style]`), followed by a backtick-wrapped `file:line` reference and description.
-- The finding body (Outcome and description) is a single block quote.
+- All findings go under a single `## Findings` heading, ordered Fix → Follow-up → Ignore.
+- Each finding's block quote starts with `**Recommendation:** <Fix|Follow-up|Ignore> — <brief reasoning>`, followed by `**Outcome:** N/A`, followed by `[Category] \`file:line\` - description`.
+- The reasoning should be a short phrase the reader can scan to understand *why* this recommendation fits (e.g., "logic error, will corrupt data", "minor naming preference", "out of scope for this PR").
+- The finding body is a single block quote containing all three lines (Recommendation, Outcome, description).
 - Every `###` finding title and its corresponding summary table row start with a status emoji: ◯ (no outcome), 🟣 (in progress/elaborate), 🟡 (ignored), 🟢 (done/fixed). Initially all are ◯.
-- Add `<br>` between findings within the same `##` section (between the end of one block quote and the next `###` heading).
-- The `<!-- @actions: elaborate, fix, ignore -->` comment goes on the `###` heading line itself (e.g., `### ◯ Finding title <!-- @actions: elaborate, fix, ignore -->`).
-- Add a numbered summary table at the top with all findings. Outcome is initially `N/A`.
-- If no findings for a recommendation group, omit that `##` section entirely.
+- Add `<br>` between findings (between the end of one block quote and the next `###` heading).
+- The `<!-- @actions: elaborate, fix, ignore -->` comment goes on the `###` heading line itself.
+- The summary table includes a `Recommendation` column (just "Fix", "Follow-up", or "Ignore" — no reasoning).
 
 After writing the file, tell the user: "Review written to `review.md`."
