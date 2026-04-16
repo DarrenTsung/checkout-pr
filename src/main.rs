@@ -413,6 +413,30 @@ fn remove_session_pid(worktree_path: &Path) {
     let _ = fs::remove_file(session_pid_file(worktree_path));
 }
 
+/// Remove the bazel output base directory for a worktree.
+/// Bazel stores its cache in /private/var/tmp/_bazel_<user>/<md5(workspace_path)>/,
+/// which can consume tens of GB per worktree and is never cleaned up automatically.
+fn remove_bazel_output_base(worktree_path: &Path) {
+    let path_str = worktree_path.to_string_lossy();
+    let hash = format!("{:x}", md5::compute(path_str.as_bytes()));
+    let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let output_base = PathBuf::from(format!("/private/var/tmp/_bazel_{}/{}", user, hash));
+    if output_base.exists() {
+        match fs::remove_dir_all(&output_base) {
+            Ok(_) => println!(
+                "    {} Removed bazel cache {}",
+                "→".blue().bold(),
+                output_base.display().to_string().dimmed()
+            ),
+            Err(e) => println!(
+                "    {} Failed to remove bazel cache: {}",
+                "⚠".yellow(),
+                e.to_string().dimmed()
+            ),
+        }
+    }
+}
+
 fn write_session_exited(worktree_path: &Path) {
     let dir = get_session_dir();
     let _ = fs::create_dir_all(&dir);
@@ -1273,6 +1297,7 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
             let color_file = worktree_color_file(&wt.path);
             let _ = fs::remove_file(color_file);
             remove_session_pid(&wt.path);
+            remove_bazel_output_base(&wt.path);
 
             println!("{}", "done".green());
             removed_count += 1;
