@@ -1613,6 +1613,10 @@ fn spawn_background_setup(
         if let Err(e) = symlink_node_modules(&worktree_path, &repo_root) {
             eprintln!("background: symlink_node_modules failed: {}", e);
         }
+
+        if let Err(e) = symlink_vendor_bundle(&worktree_path, &repo_root) {
+            eprintln!("background: symlink_vendor_bundle failed: {}", e);
+        }
     })
 }
 
@@ -2166,6 +2170,31 @@ fn symlink_node_modules(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<
     }
 
     Ok(count)
+}
+
+/// Symlink the main repo's `vendor/` directory into the worktree so Bundler
+/// can find installed gems (e.g. `numo-narray`) without re-running
+/// `bundle install` per worktree. The repo's `Gemfile`/`Gemfile.lock` are
+/// already tracked in git, so they show up in the worktree on their own —
+/// only the gitignored `vendor/bundle` install output needs help.
+///
+/// No-ops if the main repo has no `vendor/`, or if the worktree already has
+/// one (real dir or existing symlink).
+fn symlink_vendor_bundle(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
+    let source = repo_root.join("vendor");
+    if !source.is_dir() || source.is_symlink() {
+        return Ok(());
+    }
+
+    let dest = worktree_path.join("vendor");
+    if dest.exists() || dest.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+
+    std::os::unix::fs::symlink(&source, &dest)
+        .map_err(|e| format!("Failed to symlink vendor: {}", e))?;
+
+    Ok(())
 }
 
 fn symlink_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
