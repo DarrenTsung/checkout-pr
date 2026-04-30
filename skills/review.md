@@ -9,27 +9,55 @@ Run a full code review on the current branch's PR.
 
 ---
 
+## Phase 0: Determine review scope
+
+Parse `$ARGUMENTS` to determine what diff to review. Two modes:
+
+**Full-PR mode (default).** A PR number, or no argument. The scope is the full PR diff vs. its base branch.
+
+```
+SCOPE_LABEL="PR #<N>"
+SCOPE_DIFF_CMD="gh pr diff <N>"
+SCOPE_FILES_CMD="git diff --name-only $(git merge-base HEAD <base>)..HEAD"
+```
+
+If no PR number was passed, resolve from the current branch:
+```bash
+PR=$(gh pr list --head "$(git rev-parse --abbrev-ref HEAD)" --json number --jq '.[0].number')
+```
+
+**Commit-scoped mode.** `$ARGUMENTS` contains `--commits SHA1,SHA2,...` (comma-separated, in chronological order). Scope is *only* those commits' combined diff. Used by `/darren:triage-review` to re-review fix commits without re-examining the whole branch.
+
+```
+SCOPE_LABEL="commits SHA1..SHA_LAST"
+SCOPE_DIFF_CMD="git show --no-merges --first-parent SHA1 SHA2 ..."
+SCOPE_FILES_CMD="git show --name-only --pretty=format: SHA1 SHA2 ... | sort -u"
+```
+
+In commit-scoped mode, still fetch PR metadata (`gh pr view`) and PR comments — they remain useful context — but the diff under review is the commits, not the full PR.
+
+When teammate prompts below say "the PR diff," "the diff," or "this PR's changes," interpret them as `$SCOPE_LABEL`'s diff. Pass `$SCOPE_LABEL` and `$SCOPE_DIFF_CMD` into each teammate's prompt explicitly so they review the right surface.
+
+---
+
 ## Phase 1: Gather Context
 
 1. Fetch the PR details:
    - Run `gh pr view <PR_NUMBER> --json title,body,files,additions,deletions,author,baseRefName,headRefName,state,mergeable,reviewDecision`
-   - Run `gh pr diff <PR_NUMBER>` to get the full diff
-   - Run `gh pr view <PR_NUMBER> --comments` to get all PR comments (the author's comments often explain known issues, trade-offs, or intentional decisions)
-
-If the PR number was not provided as $ARGUMENTS, determine it from the current branch:
-   - Run `gh pr list --head $(git rev-parse --abbrev-ref HEAD) --json number --jq '.[0].number'`
+   - Run `$SCOPE_DIFF_CMD` to get the diff under review (full PR in default mode, just the listed commits in commit-scoped mode).
+   - Run `gh pr view <PR_NUMBER> --comments` to get all PR comments (the author's comments often explain known issues, trade-offs, or intentional decisions).
 
 ---
 
 ## Phase 2: Full Code Review
 
-Check if this PR touches multiplayer or Go code:
+Check whether the diff touches multiplayer or Go code:
 ```bash
-git diff $(git merge-base HEAD main)..HEAD --name-only | grep -E "(multiplayer|mp_)" || echo "NOT_MULTIPLAYER"
-git diff $(git merge-base HEAD main)..HEAD --name-only | grep '\.go$' || echo "NOT_GO"
+$SCOPE_FILES_CMD | grep -E "(multiplayer|mp_)" || echo "NOT_MULTIPLAYER"
+$SCOPE_FILES_CMD | grep '\.go$' || echo "NOT_GO"
 ```
 
-Create an agent team to review this PR from multiple angles. Use Opus for all teammates. Spawn the following teammates:
+Create an agent team to review this diff from multiple angles. Use Opus for all teammates. Each teammate prompt should be prefixed with the scope it covers (e.g. "Review scope: commits abc123..def456. Use `git show abc123 def456` to fetch the diff."), so commit-scoped runs don't accidentally pull in the whole PR. Spawn the following teammates:
 
 ### Teammate 1: Correctness Reviewer
 
@@ -155,11 +183,27 @@ Spawn a teammate with this prompt:
 
 ### Teammate 6: Coherence Reviewer
 
+Before spawning this teammate, **auto-discover a design doc** for this PR:
+1. Check the PR description for a link to `~/figma/dtsung/designs/` or `~/figma/dtsung/documents/` or a filename like `YYYYMMDD-*.md`.
+2. If no link, `ls ~/figma/dtsung/designs/` and look for a filename that matches the PR branch name or title.
+3. If still nothing, proceed without a design doc.
+
+Pass the discovered path (or "NO_DESIGN_DOC_FOUND") to the teammate as `DESIGN_DOC_PATH`.
+
 Spawn a teammate with this prompt:
 
 > Review this PR for coherence — does the implementation actually accomplish what the PR claims to do, and does it avoid unnecessary work? Read the PR title and body (provided via `gh pr view`) and compare against the actual diff.
 >
-> Look for:
+> `DESIGN_DOC_PATH`: {path or NO_DESIGN_DOC_FOUND}
+>
+> If `DESIGN_DOC_PATH` is a real path, read the design doc and verify:
+> - **Task list coverage**: every task in the design's task list is either completed in the diff or explicitly noted as out-of-scope in the PR description
+> - **Scope-audit coverage**: every dependent classified as "needs treatment" in the design's "Scope audit" section is actually handled in the diff. Dependents classified as "stays unchanged" must genuinely not appear in the diff, and dependents classified as "follow-up" must have a tracking link.
+> - **Design decisions**: the implementation follows the decisions recorded in the design. If the diff deviates, flag it with the design reference.
+>
+> If `DESIGN_DOC_PATH` is `NO_DESIGN_DOC_FOUND`, note that in the output ("No design doc found in the usual places; checking PR body against diff only") and skip the design-vs-diff checks.
+>
+> Always look for:
 > - **Incomplete implementation**: Features described in the PR body that aren't actually implemented in the diff
 > - **Commented-out code**: Tests or logic that was commented out rather than fixed (e.g., `// TODO: fix later`, `// skipping for now`)
 > - **Disabled tests**: Tests marked as `#[ignore]`, `.skip()`, `xit(`, `xdescribe(`, or similar — especially if they were previously enabled
@@ -239,7 +283,142 @@ Spawn a teammate with this prompt:
 >
 > Output any issues found with file paths relative to the working directory and line numbers (e.g., src/protocol.ts:45 and multiplayer/src/protocol.rs:78). For each issue, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If no issues, output "No multiplayer-specific issues found."
 
-### Teammate 9: Go Style Reviewer (only if Go PR)
+### Teammate 9: Bug Hunter Reviewer
+
+Spawn a teammate with this prompt:
+
+> You are a bug hunter reviewer. Your question is narrow: *"does this fail?"*. Look only at specific, mechanical patterns.
+>
+> **Dead wires:** Any new field on a struct that crosses a process or serialization boundary must have a populate path end-to-end. For each new struct field added in this PR:
+> 1. Is there a proto / wire schema field that maps to it?
+> 2. Is there a site that writes to it (producer side, deserializer, or translation)?
+> 3. Is there a site that reads it (consumer)?
+> Any empty or stub link in the chain is a finding. Common pattern: a sibling field is fully wired and the new one was added alongside without the proto change. Grep the codebase for where the sibling field flows and check the new field has matching wiring.
+>
+> **Peer-site drift:** When the PR modifies a reader of a shared structure (cache, registry, singleton, map), find all sibling readers in the codebase and diff them for pattern drift: nil guards, lock acquisition, error wrapping. If 2-of-3 readers have a guard and the third doesn't, *phrase the flag as a question* ("site C lacks the `!= nil` guard that sites A and B have; verify whether this is covered by a pre-condition") rather than asserting a bug. Downgrade the flag if the absent guard is documented in a code comment or guaranteed by a visible pre-condition. Legitimately different guards are common; false positives erode trust fast.
+>
+> **Lost invariants on deletion:** For every test or helper removed in the diff, extract the invariant it enforced (usually clear from the name: `AllFields`, `NoFieldForgotten`, `NoRace`, `NoAlias`) and verify that invariant is still enforced by something. If removing the test silently disables regression protection for a class of bugs, flag it. Suggest either restoring a smaller version or accepting the regression explicitly in the PR body.
+>
+> **Other classic bug patterns to flag:**
+> - Unguarded dereferences on pointers that peers guard
+> - Rollout-window races: reads sampled before `WaitForReady` / synchronization
+> - Name collisions: new types whose unqualified name collides with existing types in sibling packages
+> - Hot-path locks: if the PR replaces `atomic.*` / lock-free primitives with `sync.Mutex` / `sync.RWMutex` on paths called per-request, flag with the specific call sites
+>
+> Do NOT flag:
+> - Pre-existing bugs not touched or worsened by this diff
+> - Speculative issues without a concrete code citation
+> - Issues covered by other existing tests visible in the diff
+>
+> Output each finding with file path and line number (e.g., `src/file.go:123`), the specific pattern, and why it's a bug. For each finding, include `**Recommendation**` (Fix/Follow-up/Ignore with a short reason phrase). If none, output "No bug patterns found."
+
+### Teammate 10: Observability Reviewer
+
+Spawn a teammate with this prompt:
+
+> You are an observability reviewer. Your question is *"can we see what this is doing?"*. The checks are domain-specific: log levels, cardinality, context propagation, dashboard-partitionability, counter coverage.
+>
+> **New identifying dimensions:** If the PR introduces a data structure indexed by a new dimension (e.g., a map keyed by `WorkspaceID` that used to be a singleton, a per-tenant cache), that dimension is now the partition key of the new data model. Check that it appears in:
+> - Log lines that touch the partitioned data (`slog.InfoContext(... "workspace_id", wsID)`)
+> - Metric tags for counters/gauges on the touched code paths
+> - Observability context / trace context that flows through RPC handlers
+>
+> If you can't partition the rollout dashboard by the new dimension, coverage is incomplete.
+>
+> **Log-level choice:** Skip paths and migration-window branches in production should not be at `DebugContext`. "Silent in prod" is a bug. Raise to `WarnContext` (or an explicit metric counter) for:
+> - AfterSave-style skip branches (empty workload, workload not in registry)
+> - Cache-miss branches that indicate state hasn't synced yet
+> - Migration-window fallback branches
+>
+> **Context propagation:** `slog.InfoContext` / `slog.DebugContext` / `slog.WarnContext` / `slog.ErrorContext` wherever a `ctx` is in scope. Bare `slog.Info` etc. is a finding in any code path with a `ctx` available. (For sbox specifically, this is mandated by `services/agentplat/sbox/CLAUDE.md`; similar conventions exist elsewhere.)
+>
+> **Counter / gauge coverage on state transitions:** Flag the common gaps:
+> - Cache-miss indistinguishable from `false`: if the code returns `false` on missing cache entry without a counter tagged `{hit, miss}`, operators can't tell "feature disabled" from "state not populated yet"
+> - Rollout-progress counters: when a PR migrates A → B, is there a counter that tracks the mix of A vs B so the rollout dashboard is queryable?
+> - Skip-outcome distribution values: if a code path has success/failure/timeout outcomes, missing a `skipped` or `no_op` value hides important states
+>
+> **Lost telemetry on deletion:** Analogous to lost invariants, but applied to logs/metrics. If the diff removes a log line or metric emission without a replacement, flag it as "removed observability, no replacement visible."
+>
+> Do NOT flag:
+> - Pre-existing observability gaps unrelated to changed code
+> - Debug-level logs on truly cold paths (once-at-boot init)
+> - Cardinality explosions — if the new dimension has bounded cardinality (e.g., dozens of workspaces), it's fine
+>
+> Output each finding with file path and line number, the observability gap, and what to add. For each finding, include `**Recommendation**` (Fix/Follow-up/Ignore with a short reason phrase). If none, output "Observability coverage is adequate."
+
+### Teammate 11: Component-Test-Value Reviewer (only if sbox PR)
+
+**Only spawn this teammate if the PR touches `services/agentplat/sbox/` code.**
+
+Spawn a teammate with this prompt:
+
+> You are a component-test-value reviewer for sbox changes. Your question is *"is behavior proven to be tested, not just asserted?"*. You do NOT run tests inline — the checks are read-only and use only the diff and source. Expensive mutation-testing work is owned by `/darren:sbox-component-test-scan` and runs separately.
+>
+> **Identify touched behavior surfaces:** RPC handlers, mappers, session manager state transitions, workspace manager state transitions, bootstrap wiring, gate closures, after-save hooks, foundry sync proxy paths. Skip cosmetic-only changes (renames, comment updates, metric name adjustments).
+>
+> **Check for component-test coverage:** Does a test under `services/agentplat/sbox/sboxd/componenttest/` (or the nearest equivalent) exercise each touched surface end-to-end through the JSON-RPC surface? Component tests drive behavior through the public JSON-RPC surface, which makes them refactor-resilient and exercise cross-layer wiring that mapper/unit tests miss.
+>
+> **Distinguish pre-existing gaps:** Before flagging a coverage gap, run `git log origin/master..HEAD -- <path>` on each touched surface. If the file was changed cosmetically (rename, comment, metric name), the behavior was already present on master without coverage; classify the finding as "pre-existing coverage gap, not introduced by this PR" and do not file it as a blocker for this PR.
+>
+> **If coverage exists, judge whether it provides value by reading the test code:**
+> - *Does it exercise real production code paths, or just read back state it wrote?* The tautological pattern: a test-only setter writes to the same map a test-only getter reads from, and neither touches the production gate closures. Flag tests that only touch the map they just wrote.
+> - *Does it drive behavior through the public JSON-RPC surface?* Tests that import internals and bypass the RPC surface are unit tests in component-test clothing; they lose the cross-layer wiring guarantee.
+> - *Would a plausible regression fail this test?* Mentally inject a realistic mutation into the production code the test is meant to cover: invert a condition, skip a state transition, return the default instead of the cached value. Walk through the test assertions: would any fail? If not, the test is not load-bearing.
+> - *Does it duplicate an existing unit test of the same scenario?* If a mapper unit test already covers the exact NDJSON frames the component test feeds through the RPC surface, the component test's value is in the cross-layer wiring (e.g., agent_type → mapper-instance switch) that unit tests don't exercise. Call that out, or downgrade the component test.
+>
+> Do NOT flag:
+> - Tests for cosmetic-only changes
+> - Pre-existing tautological tests not added by this PR
+> - Missing coverage on surfaces that already had no coverage on master (file those as Follow-ups, not blockers)
+>
+> Output each finding with file and line, specific reason (e.g., "reads back what it wrote via `bootstrapCache[wsID]`, never exercises the gate closure in `session.Manager`"). For each finding, include `**Recommendation**` (Fix/Follow-up/Ignore with a short reason phrase). If coverage is valuable and present, output "Component-test coverage is valuable."
+
+### Teammate 12: Pattern Reviewer
+
+Spawn a teammate with this prompt:
+
+> You are a pattern reviewer. Your job is mechanical: scan the diff for matches against the curated bug patterns below. Unlike role-based reviewers (Correctness, Risk, Bug Hunter, etc.) who exercise judgment about what *could* go wrong, you match shapes. If a pattern shape fits a site in the diff, flag it. If it doesn't fit, don't.
+>
+> The patterns below are the kinds of bugs that humans and role-based reviewers reliably miss because they look obvious only in retrospect. Each pattern earned its spot by appearing as a real bug missed by prior review passes (e.g., caught later by Cursor Bugbot, surfaced post-merge, or fixed in a follow-up PR). Treat each as a checklist item: walk the diff, ask "does this pattern apply here?", flag every match.
+>
+> **False negatives (missed matches) are the failure mode to avoid.** False positives are also bad — only flag if the shape literally fits and the cited code is in the diff.
+>
+> ## Patterns
+>
+> 1. **Returned-resource lifecycle.** A function returns a resource handle (`*websocket.Conn`, `*os.File`, `net.Conn`, `*sql.Rows`, a lock token, an `io.Closer`). Every caller of that function must release the resource on every exit path. Walk every call site in the diff: does the caller's defer/return close it? Pay special attention when the *signature changed* in this PR to start returning a resource — old call sites that ignored the return value will leak. Sibling functions that share the same lifecycle (e.g., `Close()` and a `readPump`/`writePump` both calling the same teardown helper) should mirror each other; flag when one closes the returned handle and another discards it.
+>
+> 2. **Multi-keyed iteration produces duplicates.** When the diff iterates a structure where the same value is reachable under multiple keys (`map[K1]map[K2]V` where V is registered under multiple K1 values, a slice indexed by tag with shared entries, a fan-out registry) and collects values to process them, the collected list contains duplicates. Flag if the downstream processing is non-idempotent: closing a channel twice panics; calling `sub.close()` N times wastes work and skews counts; emitting a metric per element over-counts. The fix is dedup-by-identity before the loop.
+>
+> 3. **Bare `slog.*` in `ctx`-scope.** Every `slog.Info`/`Warn`/`Error`/`Debug` call where a `ctx context.Context` is in scope (function parameter, struct field, captured by closure) should be the `*Context` variant: `slog.InfoContext(ctx, ...)`. Bare `slog.Info(...)` in ctx-scope drops trace correlation. Flag every site. Project CLAUDE.md may mandate this explicitly (e.g., `services/agentplat/sbox/CLAUDE.md`).
+>
+> 4. **Defer assumes invariants that don't hold on every exit.** A `defer X()` added or modified in this PR fires on every function exit, including early returns, panics, and the natural exit path. Walk every exit path: does the invariant the defer assumes hold there too? Common failure: a defer that flips state (`defer func() { c.connected = false }()`) is correct on the natural exit but wrong on transport-eviction exit where the underlying connection is still alive. The fix is to gate the defer's action on the actual condition (`if c.agent == nil { c.connected = false }`).
+>
+> 5. **One-line fix not mirrored at peer call sites.** When the diff modifies a single defer/close/lock-acquisition/error-handling pattern in one function, find peer functions that share the same lifecycle. If `Close()` adds `if conn != nil { conn.Close() }` to its defer but `readPump`'s defer still discards `disconnect()`'s returned conn, the fix is incomplete. Grep for callers of the same helper; flag every peer that should mirror the change but doesn't.
+>
+> 6. **Channel send/close after consumer can drop out.** A subscription buffer with eviction-on-overflow, a watcher whose underlying channel can be closed by the dispatcher's defer, a context-cancellation that closes a channel — any path where the consumer's channel can be closed/nilled while a producer still holds a reference. Flag sends to such channels that lack a guard (closed-channel panic, send on nil blocks forever). Flag readers that re-fetch the channel field after consumer-drop and treat nil as "still connected."
+>
+> 7. **Test fix doesn't actually verify the new invariant.** A test added or modified in this PR claims to assert behavior X (per its name or comment), but the assertions only check a precondition or a downstream side effect. Examples: `TestSubscribeSelfUnsubFromConsumerLoop` waits for the first message but never asserts `unsub()` returns; `TestNoLeak` counts goroutines but doesn't actually exercise the leak path; `TestRejectsAfterClose` calls `Close()` then asserts no error on a method that doesn't return errors. Mentally inject a regression matching the test's name: would any assertion fail? If not, flag the test as not load-bearing for its stated invariant.
+>
+> 8. **Doc fix inverts the contract.** A doc comment added or rewritten in this PR (especially lock-discipline, ownership, or "must be called with X held"). Read the function body and call sites: does the doc match the actual behavior? Common failure mode in iterative review: a prior reviewer flagged "this doc is stale" and the fix rewrote the doc *the wrong direction* — now it's wrong in a different way, and four reviewers will independently flag it on the next pass. Verify lock state at every caller of the documented function.
+>
+> Do NOT flag:
+> - Patterns that match code outside the diff (pre-existing).
+> - Patterns where the cited site is exempted by an explicit comment or pre-condition (e.g., a comment says "channel is guaranteed non-nil here by the caller").
+> - Patterns where the "match" requires speculative reasoning about what could happen — only flag if the shape literally fits.
+>
+> Output each match with file:line, the pattern number/name, and a one-sentence explanation of why this site matches. For each finding, include `**Recommendation**` — usually `Fix` for a real pattern match (these are concrete bugs by construction). If none, output "No pattern matches."
+
+<!--
+Curation: this pattern list is mutable. New patterns earn a spot when (a) a
+Bugbot/postmortem/external-review finding catches something the role-based
+reviewers missed, AND (b) the bug shape generalizes beyond the one site.
+Transcribe the shape verbatim from the source incident; include enough
+detail that the reviewer can mechanically match it without inferring intent.
+Patterns retire when a linter or static-analysis check reliably catches them
+(at which point the lint becomes the enforcement, not this list).
+-->
+
+### Teammate 13: Go Style Reviewer (only if Go PR)
 
 **Only spawn this teammate if the PR touches `.go` files.**
 
