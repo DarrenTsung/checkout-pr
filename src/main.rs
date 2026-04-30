@@ -41,6 +41,7 @@ const COLOR_PALETTE: &[&str] = &[
 
 static TIMINGS_ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_WORKTREE: Mutex<Option<PathBuf>> = Mutex::new(None);
+static ACTIVE_CHILD_PID: Mutex<Option<u32>> = Mutex::new(None);
 
 thread_local! {
     static TIMING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -301,10 +302,24 @@ impl Drop for ItermGuard {
 }
 
 fn setup_ctrlc_handler() {
+    // With the `termination` feature, this fires on SIGINT, SIGTERM, and SIGHUP.
+    // SIGHUP matters for iTerm tab-close: claude (Node) ignores SIGHUP and would
+    // otherwise stay alive as an orphan, blocking the worktree from being reused.
     ctrlc::set_handler(move || {
         if ITERM_MODIFIED.load(Ordering::SeqCst) {
             reset_iterm_background();
             reset_iterm_title();
+        }
+        // Kill the claude child before we exit — otherwise it gets reparented
+        // to launchd and keeps holding the pid/worktree.
+        if let Ok(guard) = ACTIVE_CHILD_PID.lock() {
+            if let Some(pid) = *guard {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
         // Write session exited file so the worktree can be reused later.
         // PidFileGuard::drop is bypassed by process::exit, so we do it here.
@@ -314,7 +329,7 @@ fn setup_ctrlc_handler() {
                 write_session_exited(path);
             }
         }
-        std::process::exit(130); // Standard exit code for Ctrl+C
+        std::process::exit(130);
     })
     .ok();
 }
@@ -503,9 +518,12 @@ impl PidFileGuard {
         write_session_pid(worktree_path, pid);
         // Clear the exited marker so this worktree isn't considered idle
         let _ = fs::remove_file(session_exited_file(worktree_path));
-        // Register so the ctrlc handler can clean up
+        // Register so the ctrlc handler can clean up and kill the child
         if let Ok(mut guard) = ACTIVE_WORKTREE.lock() {
             *guard = Some(worktree_path.to_path_buf());
+        }
+        if let Ok(mut guard) = ACTIVE_CHILD_PID.lock() {
+            *guard = Some(pid);
         }
         Self {
             worktree_path: worktree_path.to_path_buf(),
@@ -515,8 +533,11 @@ impl PidFileGuard {
 
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
-        // Clear the global first so ctrlc handler won't double-write
+        // Clear the globals first so ctrlc handler won't double-write
         if let Ok(mut guard) = ACTIVE_WORKTREE.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = ACTIVE_CHILD_PID.lock() {
             *guard = None;
         }
         remove_session_pid(&self.worktree_path);
@@ -916,8 +937,11 @@ fn is_checkout_new_worktree(dir_name: &str) -> bool {
     ADJECTIVES.contains(&parts[0]) && NOUNS.contains(&parts[1])
 }
 
-/// Find the oldest idle worktree created by `checkout new`:
-/// no active session, has an .exited file, and no uncommitted changes.
+/// Find the oldest idle worktree created by `checkout new`: no alive session
+/// PID, and has an `.exited` marker that says "clean". Legacy worktrees closed
+/// before the SIGHUP fix won't be reused until they're closed once with the
+/// fixed binary. `git status` is deliberately not used here — it's slow enough
+/// that running it on tens of worktrees noticeably delays `checkout begin`.
 fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String> {
     timing!("find_reusable_worktree");
     let entries = list_worktree_paths(repo_root)?;
@@ -934,9 +958,15 @@ fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String
             continue;
         }
 
-        // Must have an .exited file (session ended and not resumed)
-        let exited_file = session_exited_file(path);
-        let content = match fs::read_to_string(&exited_file) {
+        // No active claude session
+        if let Some(pid) = read_session_pid(path) {
+            if is_pid_alive(pid) {
+                continue;
+            }
+        }
+
+        // Must have an `.exited` marker that recorded "clean" at close time.
+        let content = match fs::read_to_string(session_exited_file(path)) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -945,25 +975,16 @@ fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String
             Some(t) => t,
             None => continue,
         };
-        // Skip the worktree path line
-        let _ = lines.next();
-        // Check the clean/dirty status recorded at exit time
-        let status = lines.next().unwrap_or("dirty").trim();
-        if status != "clean" {
+        let _ = lines.next(); // worktree path line
+        if lines.next().unwrap_or("dirty").trim() != "clean" {
             continue;
-        }
-
-        // Must not have an active session
-        if let Some(pid) = read_session_pid(path) {
-            if is_pid_alive(pid) {
-                continue;
-            }
         }
 
         candidates.push((timestamp, path.clone()));
     }
 
-    // Pick the oldest (earliest exit timestamp)
+    // Pick the oldest (earliest exit timestamp) so freshly-closed worktrees
+    // remain easy to re-enter.
     candidates.sort_by_key(|(ts, _)| *ts);
     Ok(candidates.into_iter().next().map(|(_, path)| path))
 }
