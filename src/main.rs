@@ -421,19 +421,37 @@ fn remove_bazel_output_base(worktree_path: &Path) {
     let hash = format!("{:x}", md5::compute(path_str.as_bytes()));
     let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
     let output_base = PathBuf::from(format!("/private/var/tmp/_bazel_{}/{}", user, hash));
-    if output_base.exists() {
-        match fs::remove_dir_all(&output_base) {
-            Ok(_) => println!(
-                "    {} Removed bazel cache {}",
-                "→".blue().bold(),
-                output_base.display().to_string().dimmed()
-            ),
-            Err(e) => println!(
-                "    {} Failed to remove bazel cache: {}",
-                "⚠".yellow(),
-                e.to_string().dimmed()
-            ),
-        }
+    if !output_base.exists() {
+        return;
+    }
+    // Bazel write-protects its `external/` repos, so a plain remove hits EACCES
+    // partway through. chmod the tree writable first, then shell out to `rm -rf`
+    // since the on-disk shape (symlinks, deep external repos) is more than
+    // `fs::remove_dir_all` wants to chase down.
+    let _ = Command::new("chmod")
+        .args(["-R", "u+w", &output_base.to_string_lossy()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let status = Command::new("rm")
+        .args(["-rf", &output_base.to_string_lossy()])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!(
+            "    {} Removed bazel cache {}",
+            "→".blue().bold(),
+            output_base.display().to_string().dimmed()
+        ),
+        Ok(s) => println!(
+            "    {} Failed to remove bazel cache: rm exited with {}",
+            "⚠".yellow(),
+            s.to_string().dimmed()
+        ),
+        Err(e) => println!(
+            "    {} Failed to remove bazel cache: {}",
+            "⚠".yellow(),
+            e.to_string().dimmed()
+        ),
     }
 }
 
