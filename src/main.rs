@@ -989,33 +989,98 @@ fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String
     Ok(candidates.into_iter().next().map(|(_, path)| path))
 }
 
+/// Remove stale `*.lock` files in the worktree's per-worktree git dir.
+///
+/// A crashed prior session can leave `index.lock` (or similar) behind, which
+/// then blocks every git operation in the recycled worktree with a confusing
+/// "Another git process seems to be running" error. We only call this when
+/// recycling an idle worktree — no live session should be holding a real lock.
+fn clear_stale_worktree_locks(worktree_path: &Path) {
+    let output = match Command::new("git")
+        .args(["-C", &worktree_path.to_string_lossy(), "rev-parse", "--git-dir"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let git_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let entries = match fs::read_dir(&git_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_lock = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".lock"))
+            .unwrap_or(false);
+        if !is_lock {
+            continue;
+        }
+        // Only remove locks older than 60s as a paranoia belt — a live process
+        // would still be actively touching it.
+        let too_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d > Duration::from_secs(60))
+            .unwrap_or(false);
+        if !too_old {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            println!(
+                "{} Cleared stale lock {}",
+                "→".blue().bold(),
+                path.display().to_string().dimmed()
+            );
+        }
+    }
+}
+
 fn reset_worktree_to_master(worktree_path: &PathBuf) -> Result<(), String> {
     timing!("reset_worktree_to_master");
+    clear_stale_worktree_locks(worktree_path);
     // Fetch latest master
     print!("{} Fetching latest master... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    let status = Command::new("git")
+    let output = Command::new("git")
         .args(["-C", &worktree_path.to_string_lossy(), "fetch", "origin", "master"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to fetch: {}", e))?;
-    if !status.success() {
-        return Err("Failed to fetch origin/master".to_string());
+        .output()
+        .map_err(|e| format!("Failed to spawn git fetch: {}", e))?;
+    if !output.status.success() {
+        println!("{}", "error".red());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "git fetch origin master failed in {} (exit {}):\n{}",
+            worktree_path.display(),
+            output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+            stderr.trim()
+        ));
     }
     println!("{}", "done".green());
 
     // Reset branch to origin/master
     print!("{} Resetting to latest master... ", "→".blue().bold());
     std::io::stdout().flush().ok();
-    let status = Command::new("git")
+    let output = Command::new("git")
         .args(["-C", &worktree_path.to_string_lossy(), "reset", "--hard", "origin/master"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to reset: {}", e))?;
-    if !status.success() {
-        return Err("Failed to reset to origin/master".to_string());
+        .output()
+        .map_err(|e| format!("Failed to spawn git reset: {}", e))?;
+    if !output.status.success() {
+        println!("{}", "error".red());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "git reset --hard origin/master failed in {} (exit {}):\n{}{}{}",
+            worktree_path.display(),
+            output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+            stderr.trim(),
+            if !stderr.trim().is_empty() && !stdout.trim().is_empty() { "\n" } else { "" },
+            stdout.trim()
+        ));
     }
     println!("{}", "done".green());
 
@@ -1060,36 +1125,46 @@ fn run_new(no_claude: bool, claude_prompt: Option<String>, repo: Option<PathBuf>
         reset_worktree_to_master(&reusable)?;
 
         // Create a new branch for this workspace
-        let status = Command::new("git")
+        let output = Command::new("git")
             .args(["-C", &reusable.to_string_lossy(), "checkout", "-b", &branch_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("Failed to create branch: {}", e))?;
-        if !status.success() {
-            return Err(format!("Failed to create branch {}", branch_name));
+            .output()
+            .map_err(|e| format!("Failed to spawn git checkout: {}", e))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git checkout -b {} failed in {} (exit {}):\n{}",
+                branch_name,
+                reusable.display(),
+                output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
 
         // Rename the worktree directory to match the new workspace name
         let new_path = reusable.parent().unwrap().join(format!("branch-{}", workspace_name));
-        let status = Command::new("git")
+        let output = Command::new("git")
             .args([
                 "-C", &repo_root.to_string_lossy(),
                 "worktree", "move",
                 &reusable.to_string_lossy(),
                 &new_path.to_string_lossy(),
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("Failed to rename worktree: {}", e))?;
-        if !status.success() {
+            .output()
+            .map_err(|e| format!("Failed to spawn git worktree move: {}", e))?;
+        if !output.status.success() {
             return Err(format!(
-                "Failed to rename worktree from {} to {}",
+                "git worktree move {} → {} failed (exit {}):\n{}",
                 reusable.display(),
-                new_path.display()
+                new_path.display(),
+                output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
+
+        // `git worktree move` doesn't rename the metadata dir under
+        // `.git/worktrees/`. Rename it to match so that the working-dir name
+        // and the metadata-dir name stay in sync across recycles.
+        let new_metadata_name = format!("branch-{}", workspace_name);
+        rename_worktree_metadata(&new_path, &new_metadata_name)?;
 
         println!();
         println!(
@@ -1820,6 +1895,64 @@ fn prompt_existing_worktree_action(
             }
         }
     }
+}
+
+/// Rename a worktree's metadata directory under `.git/worktrees/` to match its
+/// new working-dir name. `git worktree move` only renames the working dir; the
+/// metadata dir keeps its original name, so a recycled worktree ends up with
+/// `branch-coy-oak/.git` pointing at `.git/worktrees/branch-rusty-marsh`.
+fn rename_worktree_metadata(worktree_path: &Path, new_metadata_name: &str) -> Result<(), String> {
+    let dot_git = worktree_path.join(".git");
+    let pointer = fs::read_to_string(&dot_git)
+        .map_err(|e| format!("Failed to read {}: {}", dot_git.display(), e))?;
+    let old_metadata_path = pointer
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("gitdir:"))
+        .ok_or_else(|| format!("{} is not a gitdir pointer file", dot_git.display()))?
+        .trim();
+    let old_metadata_path = PathBuf::from(old_metadata_path);
+
+    let metadata_parent = old_metadata_path
+        .parent()
+        .ok_or_else(|| format!("metadata path {} has no parent", old_metadata_path.display()))?;
+    let new_metadata_path = metadata_parent.join(new_metadata_name);
+
+    if old_metadata_path == new_metadata_path {
+        return Ok(());
+    }
+    if new_metadata_path.exists() {
+        return Err(format!(
+            "Cannot rename worktree metadata: {} already exists",
+            new_metadata_path.display()
+        ));
+    }
+
+    fs::rename(&old_metadata_path, &new_metadata_path).map_err(|e| {
+        format!(
+            "Failed to rename worktree metadata {} → {}: {}",
+            old_metadata_path.display(),
+            new_metadata_path.display(),
+            e
+        )
+    })?;
+
+    let new_pointer = format!("gitdir: {}\n", new_metadata_path.display());
+    fs::write(&dot_git, new_pointer)
+        .map_err(|e| format!("Failed to update {}: {}", dot_git.display(), e))?;
+
+    let output = Command::new("git")
+        .args(["-C", &worktree_path.to_string_lossy(), "rev-parse", "--git-dir"])
+        .output()
+        .map_err(|e| format!("Failed to verify worktree after metadata rename: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse failed after metadata rename:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(())
 }
 
 fn find_next_worktree_path(worktree_dir: &PathBuf, base_name: &str) -> Result<PathBuf, String> {
