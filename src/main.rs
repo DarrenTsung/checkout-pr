@@ -572,7 +572,7 @@ fn run() -> Result<(), String> {
             let prompt = read_prompt_file(claude_prompt)?;
             run_new(no_claude, prompt, repo)
         },
-        Commands::Begin { repo } => run_new(false, Some("/darren:workstream-begin multiworkspace".to_string()), repo),
+        Commands::Begin { repo } => run_new(false, Some("/darren:workstream-begin sandbox".to_string()), repo),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
         Commands::Resume { repo } => run_resume(repo),
