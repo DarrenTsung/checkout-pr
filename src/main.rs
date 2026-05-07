@@ -937,6 +937,58 @@ fn is_checkout_new_worktree(dir_name: &str) -> bool {
     ADJECTIVES.contains(&parts[0]) && NOUNS.contains(&parts[1])
 }
 
+/// Find local `darren/<adj>-<noun>` branches older than `max_age_days` that
+/// aren't currently checked out by any worktree. Returns `(branch, age_days)`
+/// sorted oldest-first.
+fn find_stale_workspace_branches(
+    repo_root: &Path,
+    active_branches: &HashSet<String>,
+    max_age_days: u64,
+) -> Result<Vec<(String, u64)>, String> {
+    let output = Command::new("git")
+        .args([
+            "-C", &repo_root.to_string_lossy(),
+            "for-each-ref",
+            "--format=%(refname:short) %(committerdate:unix)",
+            "refs/heads/darren/",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to list branches: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let max_age_secs = max_age_days * 24 * 60 * 60;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut stale: Vec<(String, u64)> = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.splitn(2, ' ');
+        let name = parts.next().unwrap_or("").trim();
+        let ts: u64 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        if name.is_empty() || active_branches.contains(name) {
+            continue;
+        }
+        let slug = name.strip_prefix("darren/").unwrap_or(name);
+        if !is_checkout_new_worktree(slug) {
+            continue;
+        }
+        let age = now.saturating_sub(ts);
+        if age >= max_age_secs {
+            stale.push((name.to_string(), age / 86_400));
+        }
+    }
+    stale.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(stale)
+}
+
 /// Find the oldest idle worktree created by `checkout new`: no alive session
 /// PID, and has an `.exited` marker that says "clean". Legacy worktrees closed
 /// before the SIGHUP fix won't be reused until they're closed once with the
@@ -1666,6 +1718,91 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
     if !all_to_remove.is_empty() {
         println!();
         remove_worktrees(&all_to_remove, &repo_root)?;
+    }
+
+    // Clean up stale workspace branches (darren/<adj>-<noun>, older than 7 days,
+    // not currently checked out by any worktree). These accumulate because
+    // `git worktree remove` doesn't delete the branch.
+    const STALE_BRANCH_AGE_DAYS: u64 = 7;
+    let active_branches: HashSet<String> = get_all_worktrees(&repo_root)?
+        .into_iter()
+        .map(|w| w.branch)
+        .collect();
+    let stale = find_stale_workspace_branches(&repo_root, &active_branches, STALE_BRANCH_AGE_DAYS)?;
+    if !stale.is_empty() {
+        println!();
+        println!(
+            "{} Found {} stale workspace branch(es) (older than {} days):\n",
+            "→".blue().bold(),
+            stale.len(),
+            STALE_BRANCH_AGE_DAYS,
+        );
+        for (name, age_days) in &stale {
+            println!(
+                "  {} {} {}",
+                format!("[{}]", "stale".red()),
+                name.cyan(),
+                format!("({} days old)", age_days).dimmed(),
+            );
+        }
+
+        let confirmed = if skip_confirm {
+            true
+        } else {
+            println!();
+            print!(
+                "{} Delete {} stale branch(es)? [y/N]: ",
+                "?".magenta().bold(),
+                stale.len(),
+            );
+            io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut input = String::new();
+            io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| format!("Failed to read input: {}", e))?;
+            input.trim().to_lowercase() == "y"
+        };
+
+        if confirmed {
+            println!();
+            let mut deleted = 0usize;
+            let mut failed: Vec<String> = Vec::new();
+            for (name, _) in &stale {
+                print!("{} Deleting {}... ", "→".blue().bold(), name.cyan());
+                io::stdout().flush().ok();
+                let output = Command::new("git")
+                    .args(["-C", &repo_root.to_string_lossy(), "branch", "-D", name])
+                    .output()
+                    .map_err(|e| format!("Failed to spawn git branch -D: {}", e))?;
+                if output.status.success() {
+                    println!("{}", "done".green());
+                    deleted += 1;
+                } else {
+                    println!("{}", "failed".red());
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let msg = stderr.trim();
+                    if !msg.is_empty() {
+                        println!("    {} {}", "error:".red(), msg);
+                    }
+                    failed.push(name.clone());
+                }
+            }
+            if deleted > 0 {
+                println!(
+                    "{} Deleted {} stale branch(es)",
+                    "✓".green().bold(),
+                    deleted,
+                );
+            }
+            if !failed.is_empty() {
+                println!(
+                    "{} Failed to delete {} branch(es): {}",
+                    "✗".red().bold(),
+                    failed.len(),
+                    failed.join(", "),
+                );
+            }
+        }
     }
 
     Ok(())
