@@ -1829,6 +1829,12 @@ fn spawn_background_setup(
         if let Err(e) = symlink_vendor_bundle(&worktree_path, &repo_root) {
             eprintln!("background: symlink_vendor_bundle failed: {}", e);
         }
+
+        // Validate the bundle against this checkout's Gemfile.lock now that the
+        // vendor/ cache is linked, so the first commit's Ruby hooks don't fail.
+        if let Err(e) = run_bundle_install(&worktree_path, &repo_root) {
+            eprintln!("background: run_bundle_install failed: {}", e);
+        }
     })
 }
 
@@ -2373,6 +2379,61 @@ fn run_mise_trust(worktree_path: &PathBuf) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Validate/install the gem bundle for a freshly created worktree so the
+/// pre-commit Ruby hooks (which run `bundle exec`) don't blow up on a bundle
+/// that doesn't match this checkout's Gemfile.lock — the failure that otherwise
+/// forces `git commit --no-verify`.
+///
+/// Mirrors `bin/create_worktree.sh`'s optimized path: point BUNDLE_PATH at the
+/// main repo's `vendor/bundle` cache (which we've already symlinked in) and run
+/// `bundle install --local --frozen`. When the worktree's lock matches the cache
+/// — the common case for a branch off master — this is a fast no-op validation
+/// (~0.5s, no network). Only when the branch's Gemfile.lock needs a gem that
+/// isn't cached do we fall back to a networked `bundle install --frozen`.
+///
+/// Runs in the background thread after `symlink_vendor_bundle`, so it never
+/// blocks time-to-prompt and finishes well before the user's first commit.
+fn run_bundle_install(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
+    // Nothing to do unless this is a Bundler project with a usable gem cache.
+    if !worktree_path.join("Gemfile").is_file() {
+        return Ok(());
+    }
+    let cache_bundle = repo_root.join("vendor/bundle");
+    if !cache_bundle.is_dir() {
+        return Ok(());
+    }
+
+    let run = |args: &[&str]| -> Result<Option<bool>, String> {
+        match Command::new("bundle")
+            .args(args)
+            .current_dir(worktree_path)
+            .env("BUNDLE_PATH", &cache_bundle)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) => Ok(Some(status.success())),
+            // Bundler isn't installed — nothing we can or should do.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("Failed to run bundle install: {}", e)),
+        }
+    };
+
+    // Fast path: validate against the cached gems with no network access.
+    match run(&["install", "--local", "--frozen"])? {
+        None => return Ok(()),       // bundle not available
+        Some(true) => return Ok(()), // bundle satisfied from cache
+        Some(false) => {}            // fall through to networked install
+    }
+
+    // Fallback: the branch's lock needs a gem the cache doesn't have.
+    match run(&["install", "--frozen"])? {
+        Some(false) => Err("bundle install failed".to_string()),
+        _ => Ok(()),
+    }
 }
 
 fn run_gt_track(worktree_path: &PathBuf) -> Result<(), String> {
