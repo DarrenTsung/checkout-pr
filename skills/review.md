@@ -339,6 +339,11 @@ Spawn a teammate with this prompt:
 >
 > **Lost telemetry on deletion:** Analogous to lost invariants, but applied to logs/metrics. If the diff removes a log line or metric emission without a replacement, flag it as "removed observability, no replacement visible."
 >
+> **Shadow → enforce promotion gate (flag-gated / shadow-mode changes):** If this PR ships behind a feature flag, in shadow mode, or as a staged rollout (kill-switch, `*_shadow`/`*_enforce` flags, percentage ramp), work out for yourself (do not ask the human): *once this is live in shadow mode, what exact metric or log query — and what threshold — would tell an operator it's safe to advance to the next stage / flip to enforce, and is that signal actually wired up here?* This is a reasoning step, not a finding by itself — only emit a finding if the signal is **missing or inadequate**:
+> - The diff references (or the rollout would rely on) a go/no-go signal — e.g. `sboxd.auth.outcome{enforce:false}` per-`usage` slice sustaining 0 — but the metric/log it needs isn't emitted by this PR's code paths and doesn't already exist. A rollout that can't be validated is a **rollout blocker → classify Fix, not Follow-up**.
+> - The success direction is observable but the failure direction isn't: under shadow mode you also need the would-block count (what *would* have been rejected), not just successes.
+> If a flag-gated/shadow-mode change has an adequate promotion signal already, do NOT emit a finding. If it's not a rollout-style change, skip this check entirely.
+>
 > Do NOT flag:
 > - Pre-existing observability gaps unrelated to changed code
 > - Debug-level logs on truly cold paths (once-at-boot init)
@@ -473,6 +478,29 @@ Spawn a teammate with this prompt:
 > - Minor naming preferences that don't affect clarity
 >
 > Output each finding with the file path relative to the working directory with line number (e.g., go/common/metrics/client.go:45), the pattern violated, and a brief fix suggestion. For each finding, also include a **Recommendation** with brief reasoning in the format `**Fix** — <reason>`, `**Follow-up** — <reason>`, or `**Ignore** — <reason>` (Fix = address in this PR; Follow-up = real issue, out of scope; Ignore = not worth changing). The reason is a short phrase that explains why this recommendation fits. If no issues, output "Go code follows style guide."
+
+### Teammate 14: PR Body Reviewer
+
+Spawn a teammate with this prompt. Pass it the PR body (from the `gh pr view` fetched in Phase 1) and the diff scope.
+
+> You are a PR-body reviewer. Your question is *"does the description give a reviewer and a future operator what they need — and, if this rolls out behind a flag, does it actually prove the rollout is safe?"*. You review the **PR body text**, cross-checked against the diff. You are NOT a code reviewer; other teammates cover the code.
+>
+> The standard is the template at `~/figma/dtsung/templates/pr-body-template.md` (read it). Hold a body to that bar. **This is a check, not a finding generator — only emit a finding when something the template asks for is missing or inadequate.** A clean, well-documented body produces zero findings.
+>
+> **Every PR — the light bar.** Flag only if absent:
+> - **Context** — the why; a reviewer with no context should understand the motivation.
+> - **Test plan** — says more than "CI green"; names what behavior the tests prove (and how — TDD/mutation/manual verification).
+>
+> **If the PR is flag-gated / staged** (infer from the diff: LaunchDarkly/Statsig gate evals, `*_shadow`/`*_enforce`-style env, percentage ramps), also check the **Feature flags** and **Rollout** sections, and flag what's missing or hand-wavy:
+> - **Feature flags:** each flag's name, system, default, what flipping it does, eval sites, and whether rollback is immediate or has nuances (e.g. requires a deploy, or is frozen at provision so a flip only affects new instances).
+> - **Rollout story** — this is the load-bearing section. The body should walk the steps (merge → validate metrics/logs → flip flag per env → validate again) and explain **how exactly the named metrics and logs prove it's safe to flip AND would catch any error that occurs.** Pressure-test that claim against the diff:
+>   - Is each referenced metric/log **actually emitted by this diff** (or already existing) **and reaching Datadog**? A go/no-go signal that depends on a metric that doesn't fire can't prove anything — that's a **Fix / merge blocker**, not a follow-up.
+>   - Is the signal **sliced** (by caller / workload / route) so a consumer the author didn't anticipate surfaces as its own failing cohort instead of hiding in an aggregate? (An unsliced auth-fail floor told us *something* was failing but not that it was the make-generic preview WS — that attribution needed `workload_name` on the metric, and the miss became #802079.)
+>   - Would it actually **catch errors**, including the ones a metric misses on its own — a consumer that fails *silently* (e.g. a preview that just goes dark needs a success-rate signal, not an error count) and a **low-frequency** consumer that may never run during the shadow window (e.g. a batch/publishing workload that boots, bootstraps, and never prompts)? If the rollout story leans entirely on a metric that wouldn't surface those, say so.
+>
+> Do NOT flag: stylistic phrasing, sections that genuinely don't apply (an ordinary PR has no flags/rollout to document — don't demand them), or detail beyond what an operator would actually need. Prefer **Fix** for a rollout signal that's actually unwired (it blocks a safe flip) and **Follow-up** for documentation gaps that don't block merge.
+>
+> Output each finding as: which template section is missing/inadequate, why it matters for *this* PR (reference the diff), and what to add. Include a **Recommendation** (Fix/Follow-up/Ignore with a short reason). If the body meets the bar, output "PR body is adequate."
 
 ---
 
