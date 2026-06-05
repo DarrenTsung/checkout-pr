@@ -190,18 +190,29 @@ Before spawning this teammate, **auto-discover a design doc** for this PR:
 
 Pass the discovered path (or "NO_DESIGN_DOC_FOUND") to the teammate as `DESIGN_DOC_PATH`.
 
+Also **discover the design's SOURCE MATERIAL** — the inputs the design was derived from — and pass it to the teammate as `SOURCE_MATERIAL`. The design can drift from its source (invent an unstated criterion, or silently override a constraint the source already settled), and a design-vs-diff check alone can't catch that — the diff faithfully matches a design that was itself wrong. Gather:
+1. **Source links** recorded in the design doc or PR body — Slack thread URLs (resolve with `slack unfurl <url>`), linked source docs (read them), tickets. The `darren:design` convention records these in a "Constraints carried from source" / sources section; read it if present.
+2. **Originating session history** — the Claude session that produced the design. Find it with `claude-sessions since <design-date> --json` (or `claude-sessions` search) matching the PR branch name / design topic, and read the relevant part with `claude-sessions read <uuid>`. This is where the human's explicit decisions and corrections live (e.g. "re-encode on serve, don't touch checkpoints").
+Pass the gathered material (thread excerpts + session UUID/excerpts, or "NO_SOURCE_MATERIAL_FOUND") as `SOURCE_MATERIAL`.
+
 Spawn a teammate with this prompt:
 
 > Review this PR for coherence — does the implementation actually accomplish what the PR claims to do, and does it avoid unnecessary work? Read the PR title and body (provided via `gh pr view`) and compare against the actual diff.
 >
 > `DESIGN_DOC_PATH`: {path or NO_DESIGN_DOC_FOUND}
+> `SOURCE_MATERIAL`: {gathered source thread/session excerpts, or NO_SOURCE_MATERIAL_FOUND}
 >
 > If `DESIGN_DOC_PATH` is a real path, read the design doc and verify:
 > - **Task list coverage**: every task in the design's task list is either completed in the diff or explicitly noted as out-of-scope in the PR description
 > - **Scope-audit coverage**: every dependent classified as "needs treatment" in the design's "Scope audit" section is actually handled in the diff. Dependents classified as "stays unchanged" must genuinely not appear in the diff, and dependents classified as "follow-up" must have a tracking link.
 > - **Design decisions**: the implementation follows the decisions recorded in the design. If the diff deviates, flag it with the design reference.
 >
-> If `DESIGN_DOC_PATH` is `NO_DESIGN_DOC_FOUND`, note that in the output ("No design doc found in the usual places; checking PR body against diff only") and skip the design-vs-diff checks.
+> If `SOURCE_MATERIAL` is provided, ALSO check that the **design itself is faithful to its source** — not just that the diff matches the design. The design doc is downstream of the source and can have drifted from it. Read `SOURCE_MATERIAL` and flag:
+> - **Invented / unsupported criteria**: the design asserts a rationale, criterion, or "what the requester wanted" that is NOT actually present in the source thread/session. (Real case: a design claimed an "off-viewport subtrees" deferral criterion the source never stated — pattern-matched from nearby code.) Flag these with the source reference; default to flagging when the design states something as the source's intent that you cannot find in the source.
+> - **Overridden constraints**: an explicit decision/constraint the source already settled that the design silently contradicts or omits. (Real case: the source settled "re-encode on serve, leave stored checkpoints byte-identical," but the design rewrote stored checkpoints.) Flag these even if the diff faithfully matches the design — the design is the thing that's wrong.
+> - **Unsettled-as-settled**: the design presents something as decided that the source left open or was still debating.
+>
+> If `DESIGN_DOC_PATH` is `NO_DESIGN_DOC_FOUND`, note that in the output ("No design doc found in the usual places; checking PR body against diff only") and skip the design-vs-diff checks. If `SOURCE_MATERIAL` is `NO_SOURCE_MATERIAL_FOUND`, note that you could not verify design-vs-source fidelity and skip those checks (don't invent a source).
 >
 > Always look for:
 > - **Incomplete implementation**: Features described in the PR body that aren't actually implemented in the diff
@@ -245,6 +256,9 @@ Spawn a teammate with this prompt:
 > - If this change breaks, what's affected? Just this feature, or does it cascade?
 > - Is there a rollback path? Feature flag? Can this be safely reverted?
 > - Does this change affect data persistence? Could bad data be written that's hard to clean up?
+>
+> **Flag-on observability (only if this PR is flag-gated):**
+> - Does the flag-on code path emit a **distinct log line or attribute** (e.g. a new log behind the flag, or a `<feature>:true` attribute) that lets you sample the sessions/requests that actually took the flag-on path during ramp? Flag it if a flag-gated change ships with no such signal — without one, the ramp can only be watched at the headline-metric level and suspicious per-session warnings go unseen. Recommend adding a distinct flag-on log.
 >
 > Do NOT flag:
 > - Theoretical risks that require extremely unlikely conditions
@@ -504,13 +518,63 @@ Spawn a teammate with this prompt. Pass it the PR body (from the `gh pr view` fe
 
 ---
 
+## Phase 2.5: Independent validation pass
+
+Before writing review.md, subject every finding to an **independent** refutation check. The Phase 2 reviewers — and this command's own synthesis — share context and a bias toward the findings they produced; a fresh subagent that has only the finding and the code, and is told to *break* the finding rather than confirm it, is the cheapest way to catch false positives before they reach review.md (and before `/triage-review` spends a fix commit on them).
+
+This is **not** redundant with `/triage-review`'s Step 2 verification. That step is this command's orchestrator re-checking its own team, serially, in the same context that produced the findings. This pass is N parallel skeptics with fresh context, one per finding. They're complementary: validation here prunes the obvious false positives so triage's deeper per-finding judgment starts from a cleaner set.
+
+### Step 1: Consolidate first
+
+Collect all findings from the Phase 2 teammates and drop the "No issues found" sentinel outputs. Consolidate duplicates **now** (not in Phase 3): if multiple teammates flag the same issue (same file, line within ±3, same substance), merge into one candidate finding and **record which reviewers flagged it** — cross-reviewer agreement is signal the validator should know about. This consolidated list is what gets validated.
+
+Findings the reviewers marked **Ignore** are still validated — `/triage-review` re-classifies recommendations, so an Ignore today may become a Fix, and a refuted Ignore is one less row to read.
+
+### Step 2: Budget
+
+If the candidate list exceeds **15** findings, validate the highest-priority 15 (Fix first, then Follow-up, then Ignore; break ties by number of agreeing reviewers, descending) and pass the over-budget tail straight to Phase 3 unvalidated, tagged `(not validated: over budget)`. **Never drop a Fix-recommended finding from validation to stay under budget** — if Fix findings alone exceed 15, raise the cap to cover all of them. In practice the high-signal reviewers + consolidation usually leave well under 15.
+
+### Step 3: Spawn one validator per finding (parallel, bounded)
+
+For each candidate finding, spawn a validator teammate on Opus (same as the reviewers). Dispatch in parallel up to the harness's active-agent limit; queue the rest and fill freed slots as validators return — treat concurrency-limit spawn errors as backpressure, not failure. Each validator is **read-only**: it may Read/Grep/Glob and run non-mutating `git`/`gh` (`git blame`, `git show`, `git log`, `gh pr view`) to gather evidence, but must not edit, commit, or switch branches.
+
+Pass each validator the finding (category, `file:line`, description, recommendation, agreeing reviewers), `$SCOPE_LABEL` + `$SCOPE_DIFF_CMD` so it fetches the same diff the reviewers saw, and this prompt:
+
+> You are an independent validator. A code-review teammate produced the finding below. Your job is **not** to confirm it — it is to **refute** it. Assume it's a false positive until the code proves otherwise.
+>
+> Finding: `[category] file:line` — description
+> Reviewer recommendation: `<Fix|Follow-up|Ignore>`
+> Flagged by: `<reviewer names>`
+> Review scope: `<$SCOPE_LABEL>`. Fetch the diff with `<$SCOPE_DIFF_CMD>`.
+>
+> Read the cited code and enough of its surroundings to judge the finding on its own merits. Try to make it wrong. A finding is **refuted** (`validated: false`) when you can show concretely that:
+> - The cited code isn't actually in this diff's scope (pre-existing, or an unchanged region) — *unless* the finding is explicitly about a pre-existing issue this PR worsens.
+> - The "bug" is already handled elsewhere in the same function or guaranteed by a visible caller pre-condition (the missing nil-check is guarded upstream; the "unused" import is used in a type annotation; the "unhandled" error is caught by a defer).
+> - The cited line number or code doesn't match what's actually there (stale or hallucinated context).
+> - It's something a linter/formatter owns (semicolons, import order, gofmt).
+> - It restates an intentional, documented decision visible in the diff or PR body.
+>
+> A finding **survives** (`validated: true`) when you read the cited code and the concern holds up — you could not refute it. When genuinely uncertain after reading the code, **survive it** and say why in one line: a borderline finding belongs in front of the human triager, not silently dropped. Cross-reviewer agreement (2+ reviewers) raises the bar for refuting — don't drop a finding multiple reviewers independently saw without a concrete reason.
+>
+> Return strictly this JSON, nothing else: `{ "validated": true | false, "reason": "<one sentence>" }`
+
+### Step 4: Collect verdicts
+
+- `validated: true` → the finding flows into Phase 3 unchanged.
+- `validated: false` → **dropped** from the Findings list and Summary table. Record it (file:line, recommendation, validator's reason) for the "Validated out" section.
+- **Validator infra failure** (timeout, dispatch error, unparseable output — not a genuine `validated:false`): do **not** drop a **Fix**-recommended finding — keep it and tag `(validation degraded)`. For Follow-up/Ignore, drop with reason "validator failed." A transient failure must never silently delete a finding the reviewer wanted fixed.
+
+Surviving findings — plus any over-budget pass-throughs and degraded Fix findings — are what Phase 3 writes.
+
+---
+
 ## Phase 3: Write Review File
 
-Wait for all teammates to complete their reviews. Then synthesize their findings into a structured markdown file.
+Wait for the Phase 2.5 validation pass to complete. Then write the surviving findings into a structured markdown file.
 
 **Cross-reference with PR comments:** Before writing each finding, check if it was already acknowledged or discussed in the PR comments you fetched in Phase 1. If the author or a reviewer already called out the issue, append "(Acknowledged by author in PR comments)" to the description.
 
-**Consolidate duplicates:** If multiple teammates flag the same issue, write it once.
+**Consolidate duplicates:** Already done in Phase 2.5 — the surviving findings are deduplicated. Don't re-merge here.
 
 **Use reviewer recommendations:** Each reviewer includes a **Recommendation** (Fix, Follow-up, or Ignore, with reasoning) for each of their findings. Carry that recommendation into the output. If multiple reviewers flag the same issue with different recommendations, use your judgment to pick the most appropriate one.
 
@@ -560,10 +624,24 @@ Write `review.md` to the worktree root with this structure:
 > **Outcome:** N/A
 >
 > [Coherence] `path/to/file.ts:101` - <description>
+
+## Validated out
+
+<details>
+<summary><N> finding(s) dropped by the independent validation pass (Phase 2.5)</summary>
+
+These were flagged by a Phase 2 reviewer but refuted by an independent validator. Listed for audit; they are **not** in the Findings list or Summary table above.
+
+| Finding | Reviewer rec | Why refuted |
+| --- | --- | --- |
+| [Category] `path/to/file.ts:88` - <short desc> | Fix | <one-line validator reason> |
+
+</details>
 ```
 
 Rules:
 - All findings go under a single `## Findings` heading, ordered Fix → Follow-up → Ignore.
+- The `## Validated out` section lists findings dropped in Phase 2.5, behind a collapsed `<details>`. **Omit the section entirely** when nothing was validated out (the common case). Blank lines around the inner markdown are required or GitHub won't render the table inside `<details>`. These rows never appear in the Summary table or Findings list.
 - Each finding's block quote starts with `**Recommendation:** <Fix|Follow-up|Ignore> — <brief reasoning>`, followed by `**Outcome:** N/A`, followed by `[Category] \`file:line\` - description`.
 - The reasoning should be a short phrase the reader can scan to understand *why* this recommendation fits (e.g., "logic error, will corrupt data", "minor naming preference", "out of scope for this PR").
 - The finding body is a single block quote containing all three lines (Recommendation, Outcome, description).
