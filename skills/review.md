@@ -513,7 +513,17 @@ Spawn a teammate with this prompt. Pass it the PR body (from the `gh pr view` fe
 >   - Is the signal **sliced** (by caller / workload / route) so a consumer the author didn't anticipate surfaces as its own failing cohort instead of hiding in an aggregate? (An unsliced auth-fail floor told us *something* was failing but not that it was the make-generic preview WS — that attribution needed `workload_name` on the metric, and the miss became #802079.)
 >   - Would it actually **catch errors**, including the ones a metric misses on its own — a consumer that fails *silently* (e.g. a preview that just goes dark needs a success-rate signal, not an error count) and a **low-frequency** consumer that may never run during the shadow window (e.g. a batch/publishing workload that boots, bootstraps, and never prompts)? If the rollout story leans entirely on a metric that wouldn't surface those, say so.
 >
-> Do NOT flag: stylistic phrasing, sections that genuinely don't apply (an ordinary PR has no flags/rollout to document — don't demand them), or detail beyond what an operator would actually need. Prefer **Fix** for a rollout signal that's actually unwired (it blocks a safe flip) and **Follow-up** for documentation gaps that don't block merge.
+> **The cold-reader bar.** A PR body is read by someone who has only the PR and the diff — none of the discussion that produced it. Iterating on a body with the author silently bakes in that familiarity; flag what a stranger can't resolve. This is about substantive comprehension, not cosmetics — only flag where the clutter genuinely impairs an unfamiliar reader:
+> - **Assumed-familiarity shorthand** — phrases that only parse if you were in the authoring discussion ("checkable per-cohort", "the gate we discussed"). Suggest a rewrite stating the *what* and *why* in plain words.
+> - **Internal cross-references** — "see Feature flags", "as mentioned above"; the point should be made where it's needed.
+> - **Implementation plumbing a reader doesn't need** — *how* a value is wired ("threaded via `workspace/create` BootstrapConfig") when the behavior and its consequence are what matter.
+> - **Unresolvable references** — local file paths (`~/figma/...`), Slack channels (`#feat-...`), internal tooling/process vocabulary (`/checkout:review`, "triage", classification codes). Inline the content or cut it. Real repo identifiers and file/function names are fine — those are greppable domain vocabulary, NOT clutter.
+> - **Disclaimers / hedging / self-justifying clutter** — apologetic or meta commentary about the author's confidence or process, editorial parentheticals like "(I'm owning these)". State things as fact.
+> - **Redundancy from iteration** — the same go/no-go criterion or rationale restated across several sections because edits piled up. Each idea should appear once, where a reader looks for it.
+>
+> Treat cold-reader findings as **Follow-up** by default (they sharpen the body but rarely block merge), unless the clutter actively misleads a reviewer about what the change does — then **Fix**.
+>
+> Do NOT flag: pure cosmetic phrasing (word choice, sentence rhythm) that a cold reader follows fine, sections that genuinely don't apply (an ordinary PR has no flags/rollout to document — don't demand them), or detail beyond what an operator would actually need. Prefer **Fix** for a rollout signal that's actually unwired (it blocks a safe flip) and **Follow-up** for documentation gaps that don't block merge.
 >
 > Output each finding as: which template section is missing/inadequate, why it matters for *this* PR (reference the diff), and what to add. Include a **Recommendation** (Fix/Follow-up/Ignore with a short reason). If the body meets the bar, output "PR body is adequate."
 
