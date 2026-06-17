@@ -246,6 +246,9 @@ Spawn a teammate with this prompt:
 > - Are there implicit ordering dependencies (e.g., "X must happen before Y") that aren't enforced?
 > - Does this code assume single-threaded execution, low latency, or bounded data sizes?
 >
+> **Replacement / swap risk:**
+> - If this PR replaces a working mechanism with a new one (credential, token, env var, dependency version, endpoint/route, config source), do NOT assume the new one has parity. Ask: what did the old path cover that the new one might not? Treat "strictly better," "same credential," or "should work" as unverified parity claims — the burden is on the PR to show the new mechanism covers every case the old one did. Absence of that evidence in the PR is the finding.
+>
 > **Look for failure modes:**
 > - What happens under concurrent access or high load?
 > - What's the failure mode if an external dependency (database, API, service) is slow or unavailable?
@@ -257,6 +260,7 @@ Spawn a teammate with this prompt:
 > - If this change breaks, what's affected? Just this feature, or does it cascade?
 > - Is there a rollback path? Feature flag? Can this be safely reverted?
 > - Does this change affect data persistence? Could bad data be written that's hard to clean up?
+> - **Weight by cost-of-recovery:** When a change's only failure remedy is a full revert (no fallback, no flag isolating just this change, no graceful degradation) and the failure would be silent or only surface at runtime, that raises the bar — recommend **Fix** (prove parity before merge or add a fallback), not Ignore. Do not downgrade a swap-with-no-safety-net to Ignore on the strength of "it should work."
 >
 > **Flag-on observability (only if this PR is flag-gated):**
 > - Does the flag-on code path emit a **distinct log line or attribute** (e.g. a new log behind the flag, or a `<feature>:true` attribute) that lets you sample the sessions/requests that actually took the flag-on path during ramp? Flag it if a flag-gated change ships with no such signal — without one, the ramp can only be watched at the headline-metric level and suspicious per-session warnings go unseen. Recommend adding a distinct flag-on log.
