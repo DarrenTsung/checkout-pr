@@ -18,8 +18,17 @@ Parse `$ARGUMENTS` to determine what diff to review. Two modes:
 ```
 SCOPE_LABEL="PR #<N>"
 SCOPE_DIFF_CMD="gh pr diff <N>"
-SCOPE_FILES_CMD="git diff --name-only $(git merge-base HEAD <base>)..HEAD"
+SCOPE_FILES_CMD="gh pr diff <N> --name-only"
 ```
+
+**Use the server-side `gh pr diff` for both the diff and the file list — never a
+local `git merge-base HEAD <base>`.** A reused/long-lived worktree often has a stale
+local `master`, so `git merge-base HEAD master` resolves to an old base and the
+local-diff scope gets contaminated with hundreds of unrelated files (the 820455
+review hit this and had to fall back to `gh pr diff`/`gh pr view --files` by hand).
+`gh pr diff` computes the diff against the PR's real base on the server, so it's
+correct regardless of local `master` freshness. If you genuinely need a local diff,
+`git fetch origin <base>` first and diff against `origin/<base>`, not the local ref.
 
 If no PR number was passed, resolve from the current branch:
 ```bash

@@ -26,10 +26,12 @@ Checkout and review PR $ARGUMENTS using the gh CLI tool.
 
 ## Phase 2: Full Code Review
 
-Check if this PR touches multiplayer or Go code:
+Check if this PR touches multiplayer or Go code. Use the server-side
+`gh pr diff --name-only` (not a local `git merge-base HEAD main`, which resolves
+against a possibly-stale local `master` and contaminates the file list):
 ```bash
-git diff $(git merge-base HEAD main)..HEAD --name-only | grep -E "(multiplayer|mp_)" || echo "NOT_MULTIPLAYER"
-git diff $(git merge-base HEAD main)..HEAD --name-only | grep '\.go$' || echo "NOT_GO"
+gh pr diff <PR_NUMBER> --name-only | grep -E "(multiplayer|mp_)" || echo "NOT_MULTIPLAYER"
+gh pr diff <PR_NUMBER> --name-only | grep '\.go$' || echo "NOT_GO"
 ```
 
 Create an agent team to review this PR from multiple angles. Use Opus for all teammates. Spawn the following teammates:
