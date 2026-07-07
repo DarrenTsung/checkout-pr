@@ -1468,13 +1468,50 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
             println!("{}", "done".green());
             removed_count += 1;
         } else {
-            println!("{}", "failed".red());
+            // `git worktree remove` is not atomic: it drops the worktree's admin
+            // registration (`.git/worktrees/<id>`) *before* recursively deleting
+            // the working directory. If that delete fails (commonly "Directory not
+            // empty" — a race with a process writing into a monorepo checkout, e.g.
+            // watchman/bazel/an IDE), git leaves an orphaned directory that it will
+            // no longer recognize ("is not a working tree"), so a retry can never
+            // recover it. Fall back to deleting the directory ourselves and pruning
+            // the (possibly stale) registration.
             let stderr = String::from_utf8_lossy(&output.stderr);
             let error_msg = stderr.trim();
-            if !error_msg.is_empty() {
-                println!("    {} {}", "error:".red(), error_msg);
+
+            let recovered = if wt.path.exists() {
+                match fs::remove_dir_all(&wt.path) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        println!("{}", "failed".red());
+                        if !error_msg.is_empty() {
+                            println!("    {} {}", "error:".red(), error_msg);
+                        }
+                        println!("    {} manual cleanup failed: {}", "error:".red(), e);
+                        false
+                    }
+                }
+            } else {
+                // Directory already gone; git just needs to prune stale metadata.
+                true
+            };
+
+            if recovered {
+                // Prune the stale registration git left behind, then run the same
+                // per-worktree cleanup the success path does.
+                let _ = Command::new("git")
+                    .args(["-C", &repo_str, "worktree", "prune"])
+                    .output();
+                let color_file = worktree_color_file(&wt.path);
+                let _ = fs::remove_file(color_file);
+                remove_session_pid(&wt.path);
+                remove_bazel_output_base(&wt.path);
+
+                println!("{}", "done (manual cleanup)".green());
+                removed_count += 1;
+            } else {
+                failed.push(dir_name);
             }
-            failed.push(dir_name);
         }
     }
 
