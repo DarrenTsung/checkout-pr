@@ -12,7 +12,7 @@ use ratatui::Terminal;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -1697,6 +1697,17 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // Kick off `git status --short` for each modified worktree in the background
+    // so the detailed file list is ready by the time we prompt. Prompting is
+    // sequential and gated on user input, so these run for free while the UI
+    // (the clean-worktree batch prompt and earlier per-worktree prompts) waits.
+    let mut status_handles: HashMap<PathBuf, thread::JoinHandle<Result<Option<String>, String>>> =
+        HashMap::new();
+    for w in &modified {
+        let path = w.path.clone();
+        status_handles.insert(w.path.clone(), thread::spawn(move || get_uncommitted_status(&path)));
+    }
+
     // Collect all confirmations upfront before any removals
     let mut all_to_remove: Vec<WorktreeInfo> = Vec::new();
 
@@ -1753,7 +1764,10 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
                 "    {}",
                 format!("created {} · last claude session {}", created_str, session_str).dimmed()
             );
-            if let Ok(Some(status)) = get_uncommitted_status(&wt.path) {
+            let status_result = status_handles.remove(&wt.path)
+                .and_then(|h| h.join().ok())
+                .unwrap_or_else(|| get_uncommitted_status(&wt.path));
+            if let Ok(Some(status)) = status_result {
                 let lines: Vec<&str> = status.lines().collect();
                 const MAX_SHOWN: usize = 10;
                 for line in lines.iter().take(MAX_SHOWN) {
