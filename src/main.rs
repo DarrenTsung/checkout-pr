@@ -2470,10 +2470,12 @@ fn run_mise_trust(worktree_path: &PathBuf) -> Result<(), String> {
 ///
 /// Mirrors `bin/create_worktree.sh`'s optimized path: point BUNDLE_PATH at the
 /// main repo's `vendor/bundle` cache (which we've already symlinked in) and run
-/// `bundle install --local --frozen`. When the worktree's lock matches the cache
-/// — the common case for a branch off master — this is a fast no-op validation
-/// (~0.5s, no network). Only when the branch's Gemfile.lock needs a gem that
-/// isn't cached do we fall back to a networked `bundle install --frozen`.
+/// `bundle install --local` in frozen mode (via `BUNDLE_FROZEN=true` in the env,
+/// not the `--frozen` flag, so Bundler doesn't persist it into the tracked
+/// `.bundle/config`). When the worktree's lock matches the cache — the common
+/// case for a branch off master — this is a fast no-op validation (~0.5s, no
+/// network). Only when the branch's Gemfile.lock needs a gem that isn't cached
+/// do we fall back to a networked `bundle install`.
 ///
 /// Runs in the background thread after `symlink_vendor_bundle`, so it never
 /// blocks time-to-prompt and finishes well before the user's first commit.
@@ -2492,6 +2494,12 @@ fn run_bundle_install(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<()
             .args(args)
             .current_dir(worktree_path)
             .env("BUNDLE_PATH", &cache_bundle)
+            // Enforce frozen mode via the environment rather than the `--frozen`
+            // CLI flag: Bundler "remembers" the flag by persisting
+            // `BUNDLE_FROZEN: "true"` into the tracked `.bundle/config`, which
+            // leaves every worktree permanently dirty. The env var is not
+            // persisted, so worktrees stay clean.
+            .env("BUNDLE_FROZEN", "true")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2505,14 +2513,14 @@ fn run_bundle_install(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<()
     };
 
     // Fast path: validate against the cached gems with no network access.
-    match run(&["install", "--local", "--frozen"])? {
+    match run(&["install", "--local"])? {
         None => return Ok(()),       // bundle not available
         Some(true) => return Ok(()), // bundle satisfied from cache
         Some(false) => {}            // fall through to networked install
     }
 
     // Fallback: the branch's lock needs a gem the cache doesn't have.
-    match run(&["install", "--frozen"])? {
+    match run(&["install"])? {
         Some(false) => Err("bundle install failed".to_string()),
         _ => Ok(()),
     }
