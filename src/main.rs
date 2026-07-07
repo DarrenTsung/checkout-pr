@@ -1732,11 +1732,42 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| wt.path.display().to_string());
 
-            print!(
-                "{} Remove {} {}? [y/N]: ",
-                "?".magenta().bold(),
+            // Worktree creation time (birthtime on macOS; falls back to mtime).
+            let created_str = fs::metadata(&wt.path)
+                .and_then(|m| m.created().or_else(|_| m.modified()))
+                .map(format_time_ago)
+                .unwrap_or_else(|_| "unknown".to_string());
+
+            // Last claude session activity in this worktree, if any.
+            let session_str = find_worktree_session_time(&wt.path)
+                .map(format_time_ago)
+                .unwrap_or_else(|| "none".to_string());
+
+            println!(
+                "{} {} {}",
+                "→".blue().bold(),
                 dir_name.cyan(),
                 "(has uncommitted changes)".yellow()
+            );
+            println!(
+                "    {}",
+                format!("created {} · last claude session {}", created_str, session_str).dimmed()
+            );
+            if let Ok(Some(status)) = get_uncommitted_status(&wt.path) {
+                let lines: Vec<&str> = status.lines().collect();
+                const MAX_SHOWN: usize = 10;
+                for line in lines.iter().take(MAX_SHOWN) {
+                    println!("    {}", line.dimmed());
+                }
+                if lines.len() > MAX_SHOWN {
+                    println!("    {}", format!("... and {} more", lines.len() - MAX_SHOWN).dimmed());
+                }
+            }
+
+            print!(
+                "{} Remove {}? [y/N]: ",
+                "?".magenta().bold(),
+                dir_name.cyan()
             );
             io::stdout().flush().map_err(|e| e.to_string())?;
 
@@ -2918,6 +2949,28 @@ fn find_worktree_session(worktree_path: &Path) -> Option<SessionInfo> {
     }
 
     Some(SessionInfo { last_modified, messages })
+}
+
+/// Most-recent Claude session activity time for a worktree, based on the
+/// mtime of its session transcripts. Lighter than `find_worktree_session`
+/// since it doesn't parse message contents.
+fn find_worktree_session_time(worktree_path: &Path) -> Option<SystemTime> {
+    let home = env::var("HOME").ok()?;
+    let encoded = encode_project_path(worktree_path);
+    let project_dir = PathBuf::from(format!("{}/.claude/projects/{}", home, encoded));
+
+    let mut best: Option<SystemTime> = None;
+    for entry in fs::read_dir(&project_dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) {
+                if best.map_or(true, |b| modified > b) {
+                    best = Some(modified);
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Format a `SystemTime` as a human-readable "time ago" string.
