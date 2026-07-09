@@ -1,0 +1,4 @@
+interface:
+  display_name: "Checkout and Review PR"
+  short_description: "Review a PR and open annotated findings"
+  default_prompt: "Use $checkout-and-review-pr to review this PR and open the findings."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Checkout PR"
+  short_description: "Inspect and discuss a checked-out PR"
+  default_prompt: "Use $checkout-pr to summarize this PR and answer questions about it."

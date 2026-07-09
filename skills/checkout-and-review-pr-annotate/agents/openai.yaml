@@ -1,0 +1,4 @@
+interface:
+  display_name: "Checkout Review Annotate"
+  short_description: "Run a multi-angle annotated PR review"
+  default_prompt: "Use $checkout-and-review-pr-annotate to review this PR in md-annotate."

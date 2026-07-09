@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -42,6 +42,7 @@ const COLOR_PALETTE: &[&str] = &[
 static TIMINGS_ENABLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_WORKTREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static ACTIVE_CHILD_PID: Mutex<Option<u32>> = Mutex::new(None);
+static ACTIVE_AGENT: Mutex<Option<Agent>> = Mutex::new(None);
 
 thread_local! {
     static TIMING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -94,7 +95,7 @@ macro_rules! timing {
 
 #[derive(Parser)]
 #[command(name = "checkout")]
-#[command(about = "Create git worktrees for PRs or new branches")]
+#[command(about = "Create git worktrees and open coding-agent sessions")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -103,6 +104,49 @@ struct Cli {
     /// Print timing information for each operation
     #[arg(long, global = true)]
     timings: bool,
+
+    /// Coding agent for new sessions and resume-last
+    #[arg(long, global = true, value_enum, default_value_t = Agent::Codex)]
+    agent: Agent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum Agent {
+    #[default]
+    Codex,
+    Claude,
+}
+
+impl Agent {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+
+    fn skill(self, claude: &'static str, codex: &'static str) -> &'static str {
+        match self {
+            Self::Codex => codex,
+            Self::Claude => claude,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -115,9 +159,9 @@ enum Commands {
         /// Optional skill to run after checkout (e.g., /walkthrough)
         skill: Option<String>,
 
-        /// Skip spawning claude after creating the worktree
-        #[arg(long)]
-        no_claude: bool,
+        /// Skip launching the coding agent after creating the worktree
+        #[arg(long = "no-agent", alias = "no-claude")]
+        no_agent: bool,
 
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
@@ -128,9 +172,9 @@ enum Commands {
         /// PR number or GitHub PR URL (e.g., 123 or https://github.com/org/repo/pull/123)
         pr: String,
 
-        /// Skip spawning claude after creating the worktree
-        #[arg(long)]
-        no_claude: bool,
+        /// Skip launching the coding agent after creating the worktree
+        #[arg(long = "no-agent", alias = "no-claude")]
+        no_agent: bool,
 
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
@@ -141,9 +185,9 @@ enum Commands {
         /// PR number or GitHub PR URL (e.g., 123 or https://github.com/org/repo/pull/123)
         pr: String,
 
-        /// Skip spawning claude after creating the worktree
-        #[arg(long)]
-        no_claude: bool,
+        /// Skip launching the coding agent after creating the worktree
+        #[arg(long = "no-agent", alias = "no-claude")]
+        no_agent: bool,
 
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
@@ -154,13 +198,13 @@ enum Commands {
         /// Branch name (e.g. darren/my-feature)
         name: String,
 
-        /// Skip spawning claude after creating the worktree
-        #[arg(long)]
-        no_claude: bool,
+        /// Skip launching the coding agent after creating the worktree
+        #[arg(long = "no-agent", alias = "no-claude")]
+        no_agent: bool,
 
-        /// Path to a file whose contents will be used as the initial Claude prompt
-        #[arg(long)]
-        claude_prompt: Option<PathBuf>,
+        /// Path to a file whose contents will be used as the initial agent prompt
+        #[arg(long = "prompt", alias = "claude-prompt")]
+        prompt: Option<PathBuf>,
 
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
@@ -168,19 +212,19 @@ enum Commands {
     },
     /// Create a new worktree with a random name
     New {
-        /// Skip spawning claude after creating the worktree
-        #[arg(long)]
-        no_claude: bool,
+        /// Skip launching the coding agent after creating the worktree
+        #[arg(long = "no-agent", alias = "no-claude")]
+        no_agent: bool,
 
-        /// Path to a file whose contents will be used as the initial Claude prompt
-        #[arg(long)]
-        claude_prompt: Option<PathBuf>,
+        /// Path to a file whose contents will be used as the initial agent prompt
+        #[arg(long = "prompt", alias = "claude-prompt")]
+        prompt: Option<PathBuf>,
 
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Create a new worktree and start with /darren:workstream-begin
+    /// Create a new worktree and start the workstream-begin skill
     Begin {
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
@@ -202,13 +246,13 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Browse worktrees with Claude sessions and resume one
+    /// Browse all worktree sessions and resume one with its original agent
     Resume {
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Resume the most recently exited Claude session
+    /// Resume the most recently exited session for the selected agent
     ResumeLast {
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
@@ -303,15 +347,15 @@ impl Drop for ItermGuard {
 
 fn setup_ctrlc_handler() {
     // With the `termination` feature, this fires on SIGINT, SIGTERM, and SIGHUP.
-    // SIGHUP matters for iTerm tab-close: claude (Node) ignores SIGHUP and would
-    // otherwise stay alive as an orphan, blocking the worktree from being reused.
+    // SIGHUP matters for iTerm tab-close: a child agent can otherwise survive
+    // the wrapper and keep the worktree from being reused.
     ctrlc::set_handler(move || {
         if ITERM_MODIFIED.load(Ordering::SeqCst) {
             reset_iterm_background();
             reset_iterm_title();
         }
-        // Kill the claude child before we exit — otherwise it gets reparented
-        // to launchd and keeps holding the pid/worktree.
+        // Kill the agent child before we exit — otherwise it can be reparented
+        // to launchd and keep holding the pid/worktree.
         if let Ok(guard) = ACTIVE_CHILD_PID.lock() {
             if let Some(pid) = *guard {
                 let _ = Command::new("kill")
@@ -326,7 +370,12 @@ fn setup_ctrlc_handler() {
         if let Ok(guard) = ACTIVE_WORKTREE.lock() {
             if let Some(path) = guard.as_ref() {
                 remove_session_pid(path);
-                write_session_exited(path);
+                let agent = ACTIVE_AGENT
+                    .lock()
+                    .ok()
+                    .and_then(|agent| *agent)
+                    .unwrap_or_default();
+                write_session_exited(path, agent);
             }
         }
         std::process::exit(130);
@@ -418,10 +467,13 @@ fn session_exited_file(worktree_path: &Path) -> PathBuf {
     get_session_dir().join(format!("{}.exited", session_file_name(worktree_path)))
 }
 
-fn write_session_pid(worktree_path: &Path, pid: u32) {
+fn write_session_pid(worktree_path: &Path, pid: u32, agent: Agent) {
     let dir = get_session_dir();
     let _ = fs::create_dir_all(&dir);
-    let _ = fs::write(session_pid_file(worktree_path), pid.to_string());
+    let _ = fs::write(
+        session_pid_file(worktree_path),
+        format!("{}\n{}", pid, agent.command()),
+    );
 }
 
 fn remove_session_pid(worktree_path: &Path) {
@@ -470,7 +522,7 @@ fn remove_bazel_output_base(worktree_path: &Path) {
     }
 }
 
-fn write_session_exited(worktree_path: &Path) {
+fn write_session_exited(worktree_path: &Path, agent: Agent) {
     let dir = get_session_dir();
     let _ = fs::create_dir_all(&dir);
     let timestamp = SystemTime::now()
@@ -484,16 +536,55 @@ fn write_session_exited(worktree_path: &Path) {
         .unwrap_or(false);
     let _ = fs::write(
         session_exited_file(worktree_path),
-        format!("{}\n{}\n{}", timestamp, worktree_path.display(), if clean { "clean" } else { "dirty" }),
+        format!(
+            "{}\n{}\n{}\n{}",
+            timestamp,
+            worktree_path.display(),
+            if clean { "clean" } else { "dirty" },
+            agent.command()
+        ),
     );
 }
 
 fn read_session_pid(worktree_path: &Path) -> Option<u32> {
     fs::read_to_string(session_pid_file(worktree_path))
         .ok()?
+        .lines()
+        .next()?
         .trim()
         .parse()
         .ok()
+}
+
+fn read_session_agent(worktree_path: &Path) -> Option<Agent> {
+    fs::read_to_string(session_pid_file(worktree_path))
+        .ok()?
+        .lines()
+        .nth(1)
+        .and_then(Agent::parse)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ExitedSession {
+    timestamp: u64,
+    worktree_path: PathBuf,
+    clean: bool,
+    agent: Agent,
+}
+
+fn parse_exited_session(content: &str) -> Option<ExitedSession> {
+    let mut lines = content.lines();
+    let timestamp = lines.next()?.trim().parse().ok()?;
+    let worktree_path = PathBuf::from(lines.next()?.trim());
+    let clean = lines.next()?.trim() == "clean";
+    // Markers written before multi-agent support could only have come from Claude.
+    let agent = lines.next().and_then(Agent::parse).unwrap_or(Agent::Claude);
+    Some(ExitedSession {
+        timestamp,
+        worktree_path,
+        clean,
+        agent,
+    })
 }
 
 fn is_pid_alive(pid: u32) -> bool {
@@ -511,11 +602,12 @@ fn is_pid_alive(pid: u32) -> bool {
 /// `status`/`clean` run detects the dead PID and cleans up.
 struct PidFileGuard {
     worktree_path: PathBuf,
+    agent: Agent,
 }
 
 impl PidFileGuard {
-    fn new(worktree_path: &Path, pid: u32) -> Self {
-        write_session_pid(worktree_path, pid);
+    fn new(worktree_path: &Path, pid: u32, agent: Agent) -> Self {
+        write_session_pid(worktree_path, pid, agent);
         // Clear the exited marker so this worktree isn't considered idle
         let _ = fs::remove_file(session_exited_file(worktree_path));
         // Register so the ctrlc handler can clean up and kill the child
@@ -525,8 +617,12 @@ impl PidFileGuard {
         if let Ok(mut guard) = ACTIVE_CHILD_PID.lock() {
             *guard = Some(pid);
         }
+        if let Ok(mut guard) = ACTIVE_AGENT.lock() {
+            *guard = Some(agent);
+        }
         Self {
             worktree_path: worktree_path.to_path_buf(),
+            agent,
         }
     }
 }
@@ -540,8 +636,11 @@ impl Drop for PidFileGuard {
         if let Ok(mut guard) = ACTIVE_CHILD_PID.lock() {
             *guard = None;
         }
+        if let Ok(mut guard) = ACTIVE_AGENT.lock() {
+            *guard = None;
+        }
         remove_session_pid(&self.worktree_path);
-        write_session_exited(&self.worktree_path);
+        write_session_exited(&self.worktree_path, self.agent);
     }
 }
 
@@ -555,29 +654,63 @@ fn default_worktree_dir() -> PathBuf {
 
 fn run() -> Result<(), String> {
     let cli = Cli::parse();
+    let agent = cli.agent;
 
     if cli.timings {
         TIMINGS_ENABLED.store(true, Ordering::Relaxed);
     }
 
     match cli.command {
-        Commands::Pr { pr, no_claude, repo, skill } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", skill.as_deref()),
-        Commands::Walkthrough { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-pr", Some("/walkthrough")),
-        Commands::Review { pr, no_claude, repo } => run_pr(&pr, no_claude, repo, "/checkout:checkout-and-review-pr", None),
-        Commands::Branch { name, no_claude, claude_prompt, repo } => {
-            let prompt = read_prompt_file(claude_prompt)?;
-            run_branch(&name, no_claude, prompt, repo)
+        Commands::Pr { pr, no_agent, repo, skill } => {
+            let initial_skill = agent.skill("/checkout:checkout-pr", "$checkout-pr");
+            let chained_skill = skill.as_deref().map(|skill| normalize_skill(agent, skill));
+            run_pr(&pr, no_agent, repo, initial_skill, chained_skill.as_deref(), agent)
         },
-        Commands::New { no_claude, claude_prompt, repo } => {
-            let prompt = read_prompt_file(claude_prompt)?;
-            run_new(no_claude, prompt, repo)
+        Commands::Walkthrough { pr, no_agent, repo } => run_pr(
+            &pr,
+            no_agent,
+            repo,
+            agent.skill("/checkout:checkout-pr", "$checkout-pr"),
+            Some(agent.skill("/walkthrough", "$walkthrough")),
+            agent,
+        ),
+        Commands::Review { pr, no_agent, repo } => run_pr(
+            &pr,
+            no_agent,
+            repo,
+            agent.skill("/checkout:checkout-and-review-pr", "$checkout-and-review-pr"),
+            None,
+            agent,
+        ),
+        Commands::Branch { name, no_agent, prompt, repo } => {
+            let prompt = read_prompt_file(prompt)?;
+            run_branch(&name, no_agent, prompt, repo, agent)
         },
-        Commands::Begin { repo } => run_new(false, Some("/darren:workstream-begin sandbox".to_string()), repo),
+        Commands::New { no_agent, prompt, repo } => {
+            let prompt = read_prompt_file(prompt)?;
+            run_new(no_agent, prompt, repo, agent)
+        },
+        Commands::Begin { repo } => run_new(
+            false,
+            Some(agent.skill("/darren:workstream-begin sandbox", "$darren-workstream-begin sandbox").to_string()),
+            repo,
+            agent,
+        ),
         Commands::Status { repo } => run_status(repo),
         Commands::Clean { repo, yes } => run_clean(repo, yes),
         Commands::Resume { repo } => run_resume(repo),
-        Commands::ResumeLast { repo } => run_resume_last(repo),
+        Commands::ResumeLast { repo } => run_resume_last(repo, agent),
     }
+}
+
+fn normalize_skill(agent: Agent, skill: &str) -> String {
+    if agent == Agent::Codex {
+        if let Some(name) = skill.strip_prefix('/') {
+            let name = name.strip_prefix("checkout:").unwrap_or(name);
+            return format!("${}", name.replace(':', "-"));
+        }
+    }
+    skill.to_string()
 }
 
 fn read_prompt_file(path: Option<PathBuf>) -> Result<Option<String>, String> {
@@ -591,7 +724,14 @@ fn read_prompt_file(path: Option<PathBuf>) -> Result<Option<String>, String> {
     }
 }
 
-fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str, chained_skill: Option<&str>) -> Result<(), String> {
+fn run_pr(
+    pr: &str,
+    no_agent: bool,
+    repo: Option<PathBuf>,
+    initial_prompt: &str,
+    chained_skill: Option<&str>,
+    agent: Agent,
+) -> Result<(), String> {
     timing!("run_pr");
     let pr_number = extract_pr_number(pr)?;
     println!(
@@ -648,7 +788,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
             thread::spawn(move || get_uncommitted_status(&path))
         };
 
-        let action = prompt_existing_worktree_action(changes_handle)?;
+        let action = prompt_existing_worktree_action(changes_handle, agent)?;
 
         match action {
             ExistingWorktreeAction::ResumeSession => {
@@ -690,13 +830,14 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
         final_path.display().to_string().cyan().bold()
     );
 
-    if no_claude {
+    prepare_agent_worktree(agent, &final_path, &repo_root)?;
+    if no_agent {
         println!(
             "\n{} Run: {} {} {}",
             "tip:".yellow().bold(),
             "cd".dimmed(),
             final_path.display(),
-            "&& claude".dimmed()
+            format!("&& {}", agent.command()).dimmed()
         );
     } else {
         let bg_color = pick_available_color(&final_path);
@@ -710,24 +851,26 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
         if resume {
             println!();
             println!(
-                "{} Resuming last claude session...",
+                "{} Resuming last {} session...",
                 "→".blue().bold(),
+                agent.display_name(),
             );
             println!();
-            spawn_claude_continue(&final_path, Some(&system_prompt))?;
+            spawn_agent_continue(agent, &final_path, Some(&system_prompt), None)?;
         } else {
             let full_prompt = match chained_skill {
-                Some(skill) => format!("{} {}\n\nAfter completing the above, run: {}", claude_prompt, pr_number, skill),
-                None => format!("{} {}", claude_prompt, pr_number),
+                Some(skill) => format!("{} {}\n\nAfter completing the above, run: {}", initial_prompt, pr_number, skill),
+                None => format!("{} {}", initial_prompt, pr_number),
             };
             println!();
             println!(
-                "{} Spawning claude with {}...",
+                "{} Spawning {} with {}...",
                 "→".blue().bold(),
+                agent.display_name(),
                 full_prompt.cyan()
             );
             println!();
-            spawn_claude_with_prompt(&final_path, &full_prompt, Some(&system_prompt))?;
+            spawn_agent_with_prompt(agent, &final_path, &full_prompt, Some(&system_prompt))?;
         }
     }
 
@@ -738,7 +881,7 @@ fn run_pr(pr: &str, no_claude: bool, repo: Option<PathBuf>, claude_prompt: &str,
     Ok(())
 }
 
-fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<String>, repo: Option<PathBuf>) -> Result<(), String> {
+fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent: Agent) -> Result<(), String> {
     timing!("run_branch");
     let branch_name = name.to_string();
 
@@ -778,7 +921,7 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<String>, repo: 
             thread::spawn(move || get_uncommitted_status(&path))
         };
 
-        let action = prompt_existing_worktree_action(changes_handle)?;
+        let action = prompt_existing_worktree_action(changes_handle, agent)?;
 
         match action {
             ExistingWorktreeAction::ResumeSession => {
@@ -814,13 +957,14 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<String>, repo: 
         final_path.display().to_string().cyan().bold()
     );
 
-    if no_claude {
+    prepare_agent_worktree(agent, &final_path, &repo_root)?;
+    if no_agent {
         println!(
             "\n{} Run: {} {} {}",
             "tip:".yellow().bold(),
             "cd".dimmed(),
             final_path.display(),
-            "&& claude".dimmed()
+            format!("&& {}", agent.command()).dimmed()
         );
     } else {
         let bg_color = pick_available_color(&final_path);
@@ -834,23 +978,25 @@ fn run_branch(name: &str, no_claude: bool, claude_prompt: Option<String>, repo: 
         if resume {
             println!();
             println!(
-                "{} Resuming last claude session...",
+                "{} Resuming last {} session...",
                 "→".blue().bold(),
+                agent.display_name(),
             );
             println!();
-            spawn_claude_continue(&final_path, Some(&system_prompt))?;
+            spawn_agent_continue(agent, &final_path, Some(&system_prompt), None)?;
         } else {
             println!();
             println!(
-                "{} Spawning claude...",
+                "{} Spawning {}...",
                 "→".blue().bold(),
+                agent.display_name(),
             );
             println!();
 
-            if let Some(prompt) = &claude_prompt {
-                spawn_claude_with_prompt(&final_path, prompt, Some(&system_prompt))?;
+            if let Some(prompt) = &prompt {
+                spawn_agent_with_prompt(agent, &final_path, prompt, Some(&system_prompt))?;
             } else {
-                spawn_claude(&final_path, Some(&system_prompt))?;
+                spawn_agent(agent, &final_path, Some(&system_prompt))?;
             }
         }
     }
@@ -1010,7 +1156,6 @@ fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String
             continue;
         }
 
-        // No active claude session
         if let Some(pid) = read_session_pid(path) {
             if is_pid_alive(pid) {
                 continue;
@@ -1022,17 +1167,14 @@ fn find_reusable_worktree(repo_root: &PathBuf) -> Result<Option<PathBuf>, String
             Ok(c) => c,
             Err(_) => continue,
         };
-        let mut lines = content.lines();
-        let timestamp: u64 = match lines.next().and_then(|l| l.trim().parse().ok()) {
-            Some(t) => t,
-            None => continue,
+        let Some(exited) = parse_exited_session(&content) else {
+            continue;
         };
-        let _ = lines.next(); // worktree path line
-        if lines.next().unwrap_or("dirty").trim() != "clean" {
+        if !exited.clean {
             continue;
         }
 
-        candidates.push((timestamp, path.clone()));
+        candidates.push((exited.timestamp, path.clone()));
     }
 
     // Pick the oldest (earliest exit timestamp) so freshly-closed worktrees
@@ -1139,7 +1281,7 @@ fn reset_worktree_to_master(worktree_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn run_new(no_claude: bool, claude_prompt: Option<String>, repo: Option<PathBuf>) -> Result<(), String> {
+fn run_new(no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent: Agent) -> Result<(), String> {
     timing!("run_new");
     let repo_root = repo.clone().unwrap_or_else(default_repo_root);
 
@@ -1225,13 +1367,14 @@ fn run_new(no_claude: bool, claude_prompt: Option<String>, repo: Option<PathBuf>
             new_path.display().to_string().cyan().bold()
         );
 
-        if no_claude {
+        prepare_agent_worktree(agent, &new_path, &repo_root)?;
+        if no_agent {
             println!(
                 "\n{} Run: {} {} {}",
                 "tip:".yellow().bold(),
                 "cd".dimmed(),
                 new_path.display(),
-                "&& claude".dimmed()
+                format!("&& {}", agent.command()).dimmed()
             );
         } else {
             let bg_color = pick_available_color(&new_path);
@@ -1243,15 +1386,16 @@ fn run_new(no_claude: bool, claude_prompt: Option<String>, repo: Option<PathBuf>
 
             println!();
             println!(
-                "{} Spawning claude...",
+                "{} Spawning {}...",
                 "→".blue().bold(),
+                agent.display_name(),
             );
             println!();
 
-            if let Some(prompt) = &claude_prompt {
-                spawn_claude_with_prompt(&new_path, prompt, Some(&system_prompt))?;
+            if let Some(prompt) = &prompt {
+                spawn_agent_with_prompt(agent, &new_path, prompt, Some(&system_prompt))?;
             } else {
-                spawn_claude(&new_path, Some(&system_prompt))?;
+                spawn_agent(agent, &new_path, Some(&system_prompt))?;
             }
         }
 
@@ -1268,7 +1412,7 @@ fn run_new(no_claude: bool, claude_prompt: Option<String>, repo: Option<PathBuf>
         workspace_name.cyan()
     );
 
-    run_branch(&branch_name, no_claude, claude_prompt, repo)
+    run_branch(&branch_name, no_agent, prompt, repo, agent)
 }
 
 #[derive(Clone)]
@@ -1277,6 +1421,7 @@ struct WorktreeInfo {
     branch: String,
     has_changes: bool,
     has_active_session: bool,
+    active_agent: Option<Agent>,
     orphaned_pids: Vec<u32>,
 }
 
@@ -1358,8 +1503,10 @@ fn get_all_worktrees(repo_root: &PathBuf) -> Result<Vec<WorktreeInfo>, String> {
                     stdout.lines().any(|l| !l.trim().is_empty() && !l.starts_with("??"))
                 })
                 .unwrap_or(false);
+            let active_agent = has_active_session
+                .then(|| read_session_agent(&path).unwrap_or(Agent::Claude));
             let orphaned_pids: Vec<u32> = Vec::new();
-            WorktreeInfo { path, branch, has_changes, has_active_session, orphaned_pids }
+            WorktreeInfo { path, branch, has_changes, has_active_session, active_agent, orphaned_pids }
         })
         .collect();
 
@@ -1392,7 +1539,12 @@ fn run_status(repo: Option<PathBuf>) -> Result<(), String> {
 
     for wt in &worktrees {
         let status = if wt.has_active_session {
-            "active".blue().bold()
+            format!(
+                "active {}",
+                wt.active_agent.unwrap_or_default().command()
+            )
+            .blue()
+            .bold()
         } else if wt.has_changes {
             "modified".yellow().bold()
         } else if !wt.orphaned_pids.is_empty() {
@@ -1425,10 +1577,9 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| wt.path.display().to_string());
 
-        // Kill orphaned claude processes before removing
         for pid in &wt.orphaned_pids {
             print!(
-                "{} Killing orphaned claude process (pid {})... ",
+                "{} Killing orphaned agent process (pid {})... ",
                 "→".blue().bold(),
                 pid.to_string().dimmed()
             );
@@ -1550,8 +1701,7 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    // Removable = no uncommitted changes AND no active (terminal-attached) session.
-    // Orphaned claude processes (no terminal) will be killed before removal.
+    // Orphaned processes are removable because remove_worktrees terminates them.
     let removable_worktrees: Vec<_> = worktrees.iter().filter(|w| !w.has_changes && !w.has_active_session).collect();
     let modified_worktrees: Vec<_> = worktrees.iter().filter(|w| w.has_changes && !w.has_active_session).collect();
     let active_worktrees: Vec<_> = worktrees.iter().filter(|w| w.has_active_session).collect();
@@ -1597,7 +1747,7 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
             let orphan_note = if !wt.orphaned_pids.is_empty() {
                 format!(
                     " {} {}",
-                    format!("(killing {} orphaned claude process{})", wt.orphaned_pids.len(),
+                    format!("(killing {} orphaned agent process{})", wt.orphaned_pids.len(),
                         if wt.orphaned_pids.len() == 1 { "" } else { "es" }).yellow(),
                     format!("pid {}", wt.orphaned_pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")).dimmed()
                 )
@@ -1644,7 +1794,7 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
             println!();
         }
         println!(
-            "{} Keeping {} worktree(s) with active Claude sessions:\n",
+            "{} Keeping {} worktree(s) with active agent sessions:\n",
             "→".blue().bold(),
             active_worktrees.len()
         );
@@ -1653,12 +1803,15 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
             let dir_name = wt.path.file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| wt.path.display().to_string());
+            let active_status = format!("[{}]", "active".blue().bold());
+            let branch_status = format!("({})", wt.branch).dimmed();
 
             println!(
-                "  {} {} {}",
-                format!("[{}]", "active".blue().bold()),
+                "  {} {} {} {}",
+                active_status,
                 dir_name.cyan(),
-                format!("({})", wt.branch).dimmed()
+                branch_status,
+                wt.active_agent.unwrap_or_default().display_name().dimmed()
             );
         }
     }
@@ -1707,6 +1860,8 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
         let path = w.path.clone();
         status_handles.insert(w.path.clone(), thread::spawn(move || get_uncommitted_status(&path)));
     }
+    let modified_paths = modified.iter().map(|worktree| worktree.path.clone()).collect();
+    let agent_session_times = find_agent_session_times(&modified_paths);
 
     // Collect all confirmations upfront before any removals
     let mut all_to_remove: Vec<WorktreeInfo> = Vec::new();
@@ -1749,8 +1904,9 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
                 .map(format_time_ago)
                 .unwrap_or_else(|_| "unknown".to_string());
 
-            // Last claude session activity in this worktree, if any.
-            let session_str = find_worktree_session_time(&wt.path)
+            let session_str = agent_session_times
+                .get(&wt.path)
+                .copied()
                 .map(format_time_ago)
                 .unwrap_or_else(|| "none".to_string());
 
@@ -1762,7 +1918,7 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
             );
             println!(
                 "    {}",
-                format!("created {} · last claude session {}", created_str, session_str).dimmed()
+                format!("created {} · last agent session {}", created_str, session_str).dimmed()
             );
             let status_result = status_handles.remove(&wt.path)
                 .and_then(|h| h.join().ok())
@@ -1956,18 +2112,6 @@ fn create_new_worktree_from_remote(
         println!("  {}", "done".green());
     }
 
-    // Copy claude settings
-    print!("{} Copying claude settings... ", "→".blue().bold());
-    std::io::stdout().flush().ok();
-    symlink_claude_settings(worktree_path, repo_root)?;
-    println!("{}", "done".green());
-
-    // Add claude trust
-    print!("{} Adding claude trust... ", "→".blue().bold());
-    std::io::stdout().flush().ok();
-    add_claude_trust(worktree_path, repo_root)?;
-    println!("{}", "done".green());
-
     Ok(())
 }
 
@@ -2005,18 +2149,6 @@ fn create_new_worktree_new_branch(
     run_gt_track(worktree_path)?;
     println!("{}", "done".green());
 
-    // Copy claude settings
-    print!("{} Copying claude settings... ", "→".blue().bold());
-    std::io::stdout().flush().ok();
-    symlink_claude_settings(worktree_path, repo_root)?;
-    println!("{}", "done".green());
-
-    // Add claude trust
-    print!("{} Adding claude trust... ", "→".blue().bold());
-    std::io::stdout().flush().ok();
-    add_claude_trust(worktree_path, repo_root)?;
-    println!("{}", "done".green());
-
     Ok(())
 }
 
@@ -2038,11 +2170,13 @@ fn get_uncommitted_status(worktree_path: &PathBuf) -> Result<Option<String>, Str
 
 fn prompt_existing_worktree_action(
     changes_handle: thread::JoinHandle<Result<Option<String>, String>>,
+    agent: Agent,
 ) -> Result<ExistingWorktreeAction, String> {
     println!();
     println!(
-        "  {} Resume last claude session {}",
+        "  {} Resume last {} session {}",
         "[1]".cyan().bold(),
+        agent.display_name(),
         "(keep changes, skip update)".dimmed()
     );
     println!("  {} Use existing worktree", "[2]".cyan().bold());
@@ -2618,6 +2752,28 @@ fn symlink_vendor_bundle(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result
     Ok(())
 }
 
+fn prepare_agent_worktree(
+    agent: Agent,
+    worktree_path: &PathBuf,
+    repo_root: &PathBuf,
+) -> Result<(), String> {
+    if agent != Agent::Claude {
+        return Ok(());
+    }
+
+    print!("{} Copying Claude settings... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    symlink_claude_settings(worktree_path, repo_root)?;
+    println!("{}", "done".green());
+
+    print!("{} Adding Claude trust... ", "→".blue().bold());
+    std::io::stdout().flush().ok();
+    add_claude_trust(worktree_path, repo_root)?;
+    println!("{}", "done".green());
+
+    Ok(())
+}
+
 fn symlink_claude_settings(worktree_path: &PathBuf, repo_root: &PathBuf) -> Result<(), String> {
     timing!("symlink_claude_settings");
     // Symlink the main repo's .claude/settings.local.json into the worktree
@@ -2746,74 +2902,129 @@ fn build_worktree_system_prompt() -> String {
         .to_string()
 }
 
-fn spawn_claude_with_prompt(worktree_path: &PathBuf, prompt: &str, append_system_prompt: Option<&str>) -> Result<(), String> {
+fn spawn_agent_with_prompt(
+    agent: Agent,
+    worktree_path: &PathBuf,
+    prompt: &str,
+    developer_instructions: Option<&str>,
+) -> Result<(), String> {
+    spawn_agent_process(
+        agent,
+        worktree_path,
+        Some(prompt),
+        developer_instructions,
+        None,
+        false,
+    )
+}
+
+fn spawn_agent_continue(
+    agent: Agent,
+    worktree_path: &PathBuf,
+    developer_instructions: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    spawn_agent_process(
+        agent,
+        worktree_path,
+        None,
+        developer_instructions,
+        session_id,
+        true,
+    )
+}
+
+fn spawn_agent(
+    agent: Agent,
+    worktree_path: &PathBuf,
+    developer_instructions: Option<&str>,
+) -> Result<(), String> {
+    spawn_agent_process(agent, worktree_path, None, developer_instructions, None, false)
+}
+
+fn spawn_agent_process(
+    agent: Agent,
+    worktree_path: &PathBuf,
+    prompt: Option<&str>,
+    developer_instructions: Option<&str>,
+    session_id: Option<&str>,
+    resume: bool,
+) -> Result<(), String> {
     set_terminal_cwd(worktree_path);
 
-    let mut cmd = Command::new("claude");
-    cmd.args(["--permission-mode", "acceptEdits"])
-        .arg(prompt);
-    if let Some(system_prompt) = append_system_prompt {
-        cmd.args(["--append-system-prompt", system_prompt]);
-    }
+    let mut cmd = Command::new(agent.command());
+    cmd.args(build_agent_args(
+        agent,
+        prompt,
+        developer_instructions,
+        resume,
+        session_id,
+    )?);
+
     let mut child = cmd
         .current_dir(worktree_path)
         .spawn()
-        .map_err(|e| format!("Failed to spawn claude: {}", e))?;
+        .map_err(|e| format!("Failed to spawn {}: {}", agent.command(), e))?;
 
-    let _pid_guard = PidFileGuard::new(worktree_path, child.id());
-    let status = child.wait().map_err(|e| format!("Failed to wait for claude: {}", e))?;
+    let _pid_guard = PidFileGuard::new(worktree_path, child.id(), agent);
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for {}: {}", agent.command(), e))?;
 
     if !status.success() {
-        return Err("claude exited with error".to_string());
+        return Err(format!("{} exited with error", agent.command()));
     }
 
     Ok(())
 }
 
-fn spawn_claude_continue(worktree_path: &PathBuf, append_system_prompt: Option<&str>) -> Result<(), String> {
-    set_terminal_cwd(worktree_path);
-
-    let mut cmd = Command::new("claude");
-    cmd.args(["--permission-mode", "acceptEdits", "--continue"]);
-    if let Some(system_prompt) = append_system_prompt {
-        cmd.args(["--append-system-prompt", system_prompt]);
+fn build_agent_args(
+    agent: Agent,
+    prompt: Option<&str>,
+    developer_instructions: Option<&str>,
+    resume: bool,
+    session_id: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    match agent {
+        Agent::Claude => {
+            args.extend(["--permission-mode".to_string(), "acceptEdits".to_string()]);
+            if resume {
+                args.push("--continue".to_string());
+            }
+            if let Some(prompt) = prompt {
+                args.push(prompt.to_string());
+            }
+            if let Some(instructions) = developer_instructions {
+                args.extend([
+                    "--append-system-prompt".to_string(),
+                    instructions.to_string(),
+                ]);
+            }
+        }
+        Agent::Codex => {
+            if let Some(instructions) = developer_instructions {
+                let value = serde_json::to_string(instructions)
+                    .map_err(|e| format!("Failed to encode Codex developer instructions: {}", e))?;
+                args.extend([
+                    "--config".to_string(),
+                    format!("developer_instructions={}", value),
+                ]);
+            }
+            if resume {
+                args.push("resume".to_string());
+                if let Some(session_id) = session_id {
+                    args.push(session_id.to_string());
+                } else {
+                    args.push("--last".to_string());
+                }
+            }
+            if let Some(prompt) = prompt {
+                args.push(prompt.to_string());
+            }
+        }
     }
-    let mut child = cmd
-        .current_dir(worktree_path)
-        .spawn()
-        .map_err(|e| format!("Failed to spawn claude: {}", e))?;
-
-    let _pid_guard = PidFileGuard::new(worktree_path, child.id());
-    let status = child.wait().map_err(|e| format!("Failed to wait for claude: {}", e))?;
-
-    if !status.success() {
-        return Err("claude exited with error".to_string());
-    }
-
-    Ok(())
-}
-
-fn spawn_claude(worktree_path: &PathBuf, append_system_prompt: Option<&str>) -> Result<(), String> {
-    set_terminal_cwd(worktree_path);
-
-    let mut cmd = Command::new("claude");
-    cmd.args(["--permission-mode", "acceptEdits"]);
-    if let Some(system_prompt) = append_system_prompt {
-        cmd.args(["--append-system-prompt", system_prompt]);
-    }
-    let mut child = cmd
-        .current_dir(worktree_path)
-        .spawn()
-        .map_err(|e| format!("Failed to spawn claude: {}", e))?;
-
-    let _pid_guard = PidFileGuard::new(worktree_path, child.id());
-    let status = child.wait().map_err(|e| format!("Failed to wait for claude: {}", e))?;
-
-    if !status.success() {
-        return Err("claude exited with error".to_string());
-    }
-
-    Ok(())
+    Ok(args)
 }
 
 // ---------- resume subcommand ----------
@@ -2826,6 +3037,8 @@ struct ChatMessage {
 struct SessionInfo {
     last_modified: SystemTime,
     messages: Vec<ChatMessage>,
+    agent: Agent,
+    resume_id: Option<String>,
 }
 
 struct WorktreeSession {
@@ -2872,7 +3085,7 @@ fn tail_lines(path: &Path, max_bytes: u64) -> Result<Vec<String>, String> {
 }
 
 /// Parse JSONL lines to extract the last N user/assistant chat messages.
-fn parse_session_messages(jsonl_path: &Path, max_messages: usize) -> Vec<ChatMessage> {
+fn parse_claude_session_messages(jsonl_path: &Path, max_messages: usize) -> Vec<ChatMessage> {
     // Read last ~256KB — plenty for recent messages
     let lines = match tail_lines(jsonl_path, 256 * 1024) {
         Ok(l) => l,
@@ -2934,7 +3147,7 @@ fn parse_session_messages(jsonl_path: &Path, max_messages: usize) -> Vec<ChatMes
 }
 
 /// Find the most recent Claude session for a worktree path.
-fn find_worktree_session(worktree_path: &Path) -> Option<SessionInfo> {
+fn find_claude_worktree_session(worktree_path: &Path) -> Option<SessionInfo> {
     let home = env::var("HOME").ok()?;
     let encoded = encode_project_path(worktree_path);
     let project_dir = PathBuf::from(format!("{}/.claude/projects/{}", home, encoded));
@@ -2964,19 +3177,24 @@ fn find_worktree_session(worktree_path: &Path) -> Option<SessionInfo> {
 
     let jsonl_path = best_path?;
     let last_modified = best_time?;
-    let messages = parse_session_messages(&jsonl_path, 50);
+    let messages = parse_claude_session_messages(&jsonl_path, 50);
 
     if messages.is_empty() {
         return None;
     }
 
-    Some(SessionInfo { last_modified, messages })
+    Some(SessionInfo {
+        last_modified,
+        messages,
+        agent: Agent::Claude,
+        resume_id: None,
+    })
 }
 
 /// Most-recent Claude session activity time for a worktree, based on the
 /// mtime of its session transcripts. Lighter than `find_worktree_session`
 /// since it doesn't parse message contents.
-fn find_worktree_session_time(worktree_path: &Path) -> Option<SystemTime> {
+fn find_claude_worktree_session_time(worktree_path: &Path) -> Option<SystemTime> {
     let home = env::var("HOME").ok()?;
     let encoded = encode_project_path(worktree_path);
     let project_dir = PathBuf::from(format!("{}/.claude/projects/{}", home, encoded));
@@ -2993,6 +3211,197 @@ fn find_worktree_session_time(worktree_path: &Path) -> Option<SystemTime> {
         }
     }
     best
+}
+
+fn get_codex_session_dir() -> PathBuf {
+    if let Ok(codex_home) = env::var("CODEX_HOME") {
+        return PathBuf::from(codex_home).join("sessions");
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".codex/sessions")
+}
+
+fn collect_jsonl_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, files);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+}
+
+fn codex_session_metadata(jsonl_path: &Path) -> Option<(PathBuf, String)> {
+    let file = fs::File::open(jsonl_path).ok()?;
+    let first_line = io::BufReader::new(file).lines().next()?.ok()?;
+    let value: Value = serde_json::from_str(&first_line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    // Checkout launches top-level CLI sessions. Excluding subagent transcripts
+    // prevents a worker's partial conversation from replacing the parent session.
+    if payload.get("source").and_then(Value::as_str) != Some("cli") {
+        return None;
+    }
+    let worktree = payload.get("cwd").and_then(Value::as_str).map(PathBuf::from)?;
+    let session_id = payload.get("id").and_then(Value::as_str)?.to_string();
+    Some((worktree, session_id))
+}
+
+fn latest_codex_session_files(
+    worktree_paths: &HashSet<PathBuf>,
+) -> HashMap<PathBuf, (SystemTime, PathBuf, String)> {
+    let mut files = Vec::new();
+    collect_jsonl_files(&get_codex_session_dir(), &mut files);
+
+    let mut latest: HashMap<PathBuf, (SystemTime, PathBuf, String)> = HashMap::new();
+    for path in files {
+        let Some((worktree_path, session_id)) = codex_session_metadata(&path) else {
+            continue;
+        };
+        if !worktree_paths.contains(&worktree_path) {
+            continue;
+        }
+        let Ok(modified) = fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        let replace = latest
+            .get(&worktree_path)
+            .is_none_or(|(current, _, _)| modified > *current);
+        if replace {
+            latest.insert(worktree_path, (modified, path, session_id));
+        }
+    }
+    latest
+}
+
+fn parse_codex_session_messages(jsonl_path: &Path, max_messages: usize) -> Vec<ChatMessage> {
+    let lines = match tail_lines(jsonl_path, 256 * 1024) {
+        Ok(lines) => lines,
+        Err(_) => return Vec::new(),
+    };
+    let mut messages = Vec::new();
+
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(role) = payload.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+
+        let expected_type = if role == "user" { "input_text" } else { "output_text" };
+        let content = payload
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some(expected_type))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .filter(|text| role != "user" || !text.trim_start().starts_with('<'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !content.trim().is_empty() {
+            messages.push(ChatMessage {
+                role: role.to_string(),
+                content,
+            });
+        }
+    }
+
+    let start = messages.len().saturating_sub(max_messages);
+    messages.split_off(start)
+}
+
+fn find_agent_sessions(
+    agent: Agent,
+    entries: Vec<(PathBuf, String)>,
+) -> Vec<WorktreeSession> {
+    match agent {
+        Agent::Claude => entries
+            .into_iter()
+            .filter_map(|(path, branch)| {
+                let session = find_claude_worktree_session(&path)?;
+                Some(WorktreeSession {
+                    worktree: WorktreeInfo {
+                        path,
+                        branch,
+                        has_changes: false,
+                        has_active_session: false,
+                        active_agent: None,
+                        orphaned_pids: Vec::new(),
+                    },
+                    session,
+                })
+            })
+            .collect(),
+        Agent::Codex => {
+            let branches: HashMap<PathBuf, String> = entries.into_iter().collect();
+            let worktree_paths = branches.keys().cloned().collect();
+            latest_codex_session_files(&worktree_paths)
+                .into_iter()
+                .filter_map(|(path, (last_modified, jsonl_path, session_id))| {
+                    let messages = parse_codex_session_messages(&jsonl_path, 50);
+                    let branch = branches.get(&path)?.clone();
+                    Some(WorktreeSession {
+                        worktree: WorktreeInfo {
+                            path,
+                            branch,
+                            has_changes: false,
+                            has_active_session: false,
+                            active_agent: None,
+                            orphaned_pids: Vec::new(),
+                        },
+                        session: SessionInfo {
+                            last_modified,
+                            messages,
+                            agent: Agent::Codex,
+                            resume_id: Some(session_id),
+                        },
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+fn find_all_agent_sessions(entries: Vec<(PathBuf, String)>) -> Vec<WorktreeSession> {
+    let mut sessions = find_agent_sessions(Agent::Codex, entries.clone());
+    sessions.extend(find_agent_sessions(Agent::Claude, entries));
+    sessions
+}
+
+fn find_agent_session_times(worktree_paths: &HashSet<PathBuf>) -> HashMap<PathBuf, SystemTime> {
+    let mut times = HashMap::new();
+    for path in worktree_paths {
+        if let Some(modified) = find_claude_worktree_session_time(path) {
+            times.insert(path.clone(), modified);
+        }
+    }
+    for (path, (modified, _, _)) in latest_codex_session_files(worktree_paths) {
+        times
+            .entry(path)
+            .and_modify(|current| *current = (*current).max(modified))
+            .or_insert(modified);
+    }
+    times
 }
 
 /// Format a `SystemTime` as a human-readable "time ago" string.
@@ -3072,26 +3481,13 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
     }
 
     // Find sessions via filesystem reads only — skip worktrees without sessions
-    print!("{} Finding Claude sessions... ", "→".blue().bold());
+    print!("{} Finding agent sessions... ", "→".blue().bold());
     io::stdout().flush().ok();
-    let mut sessions: Vec<WorktreeSession> = entries
-        .into_iter()
-        .filter_map(|(path, branch)| {
-            let session = find_worktree_session(&path)?;
-            let worktree = WorktreeInfo {
-                path,
-                branch,
-                has_changes: false,
-                has_active_session: false,
-                orphaned_pids: Vec::new(),
-            };
-            Some(WorktreeSession { worktree, session })
-        })
-        .collect();
+    let mut sessions = find_all_agent_sessions(entries);
     println!("{} ({} with sessions)", "done".green(), sessions.len());
 
     if sessions.is_empty() {
-        println!("{} No worktrees with Claude sessions found", "→".blue().bold());
+        println!("{} No worktrees with agent sessions found", "→".blue().bold());
         return Ok(());
     }
 
@@ -3107,8 +3503,9 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
 
     let ws = &sessions[idx];
     let worktree_path = &ws.worktree.path;
+    let agent = ws.session.agent;
 
-    // Set up iTerm colors and spawn claude --continue
+    prepare_agent_worktree(agent, worktree_path, &repo_root)?;
     let bg_color = pick_available_color(worktree_path);
     save_worktree_color(worktree_path, &bg_color)?;
 
@@ -3120,12 +3517,18 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
         worktree_path.display().to_string().cyan()
     );
 
-    spawn_claude_continue(worktree_path, None)?;
+    let developer_instructions = build_worktree_system_prompt();
+    spawn_agent_continue(
+        agent,
+        worktree_path,
+        Some(&developer_instructions),
+        ws.session.resume_id.as_deref(),
+    )?;
 
     Ok(())
 }
 
-fn run_resume_last(repo: Option<PathBuf>) -> Result<(), String> {
+fn run_resume_last(repo: Option<PathBuf>, agent: Agent) -> Result<(), String> {
     timing!("run_resume_last");
     let repo_root = repo.unwrap_or_else(default_repo_root);
 
@@ -3152,15 +3555,14 @@ fn run_resume_last(repo: Option<PathBuf>) -> Result<(), String> {
             Err(_) => continue,
         };
 
-        let mut lines = content.lines();
-        let timestamp: u64 = match lines.next().and_then(|l| l.trim().parse().ok()) {
-            Some(t) => t,
-            None => continue,
+        let Some(exited) = parse_exited_session(&content) else {
+            continue;
         };
-        let worktree_path = match lines.next() {
-            Some(p) => PathBuf::from(p.trim()),
-            None => continue,
-        };
+        if exited.agent != agent {
+            continue;
+        }
+        let timestamp = exited.timestamp;
+        let worktree_path = exited.worktree_path;
 
         // Skip if worktree no longer exists
         if !worktree_path.exists() {
@@ -3196,6 +3598,7 @@ fn run_resume_last(repo: Option<PathBuf>) -> Result<(), String> {
         worktree_path.display().to_string().cyan()
     );
 
+    prepare_agent_worktree(agent, &worktree_path, &repo_root)?;
     let bg_color = pick_available_color(&worktree_path);
     save_worktree_color(&worktree_path, &bg_color)?;
 
@@ -3205,12 +3608,13 @@ fn run_resume_last(repo: Option<PathBuf>) -> Result<(), String> {
 
     println!();
     println!(
-        "{} Resuming claude session...",
+        "{} Resuming {} session...",
         "→".blue().bold(),
+        agent.display_name(),
     );
     println!();
 
-    spawn_claude_continue(&worktree_path, Some(&system_prompt))?;
+    spawn_agent_continue(agent, &worktree_path, Some(&system_prompt), None)?;
 
     Ok(())
 }
@@ -3356,8 +3760,9 @@ fn build_spans_from_styled_chars<'a>(chars: &[(char, Style)]) -> Vec<Span<'a>> {
 
 /// Render messages for a session into display lines, fitting within a line budget.
 fn render_session_messages(ws: &WorktreeSession, max_lines: usize, msg_width: usize) -> Vec<Line<'static>> {
-    let prefix_width = 14; // "    ┃ Claude " = 14 chars
+    let prefix_width = 14; // "    ┃ <agent> " with a six-character label
     let effective_msg_width = if msg_width > prefix_width + 4 { msg_width - prefix_width } else { 40 };
+    let agent_label = ws.session.agent.display_name();
 
     let mut all_msg_lines: Vec<Vec<Line>> = Vec::new();
 
@@ -3366,7 +3771,7 @@ fn render_session_messages(ws: &WorktreeSession, max_lines: usize, msg_width: us
             ("You   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
              Style::default().fg(Color::White))
         } else {
-            ("Claude", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            (agent_label, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
              Style::default().fg(Color::Gray))
         };
 
@@ -3446,7 +3851,7 @@ fn render_session_messages(ws: &WorktreeSession, max_lines: usize, msg_width: us
             let (label, label_style) = if partial_msg.role == "user" {
                 ("You   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
             } else {
-                ("Claude", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+                (agent_label, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
             };
             lines.push(Line::from(vec![
                 Span::styled("    ┃ ", Style::default().fg(Color::DarkGray)),
@@ -3469,7 +3874,7 @@ fn render_session_messages(ws: &WorktreeSession, max_lines: usize, msg_width: us
         let (label, label_style) = if newest_msg.role == "user" {
             ("You   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
         } else {
-            ("Claude", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+            (agent_label, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
         };
         lines.push(Line::from(vec![
             Span::styled("    ┃ ", Style::default().fg(Color::DarkGray)),
@@ -3647,4 +4052,208 @@ fn run_resume_tui(sessions: &[WorktreeSession]) -> Result<Option<usize>, String>
     terminal.show_cursor().map_err(|e| format!("Failed to show cursor: {}", e))?;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_is_the_default_agent() {
+        let cli = Cli::try_parse_from(["checkout", "new", "--no-agent"]).unwrap();
+        assert_eq!(cli.agent, Agent::Codex);
+        assert!(matches!(cli.command, Commands::New { no_agent: true, .. }));
+    }
+
+    #[test]
+    fn claude_and_legacy_flags_remain_supported() {
+        let cli = Cli::try_parse_from([
+            "checkout",
+            "new",
+            "--agent",
+            "claude",
+            "--no-claude",
+            "--claude-prompt",
+            "/tmp/prompt.md",
+        ])
+        .unwrap();
+        assert_eq!(cli.agent, Agent::Claude);
+        assert!(matches!(
+            cli.command,
+            Commands::New {
+                no_agent: true,
+                prompt: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn translates_claude_skill_syntax_for_codex() {
+        assert_eq!(normalize_skill(Agent::Codex, "/walkthrough"), "$walkthrough");
+        assert_eq!(
+            normalize_skill(Agent::Codex, "/checkout:checkout-pr"),
+            "$checkout-pr"
+        );
+        assert_eq!(normalize_skill(Agent::Claude, "/walkthrough"), "/walkthrough");
+    }
+
+    #[test]
+    fn exited_markers_are_agent_aware_and_backward_compatible() {
+        let current = parse_exited_session("123\n/tmp/branch-a\nclean\ncodex").unwrap();
+        assert_eq!(current.agent, Agent::Codex);
+        assert!(current.clean);
+
+        let legacy = parse_exited_session("456\n/tmp/branch-b\ndirty").unwrap();
+        assert_eq!(legacy.agent, Agent::Claude);
+        assert!(!legacy.clean);
+    }
+
+    #[test]
+    fn parses_codex_messages_without_injected_context() {
+        let path = env::temp_dir().join(format!(
+            "checkout-codex-session-parser-{}.jsonl",
+            std::process::id()
+        ));
+        let records = [
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "hidden"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "<environment_context>hidden</environment_context>"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Implement the change"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done"}]
+                }
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let messages = parse_codex_session_messages(&path, 50);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "Implement the change");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].content, "Done");
+    }
+
+    #[test]
+    fn reads_codex_cli_session_identity() {
+        let path = env::temp_dir().join(format!(
+            "checkout-codex-session-meta-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "019f4918-33a8-7542-96cf-cfcfb2886c75",
+                    "cwd": "/tmp/branch-a",
+                    "source": "cli"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let metadata = codex_session_metadata(&path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(
+            metadata,
+            Some((
+                PathBuf::from("/tmp/branch-a"),
+                "019f4918-33a8-7542-96cf-cfcfb2886c75".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn builds_codex_launch_and_resume_arguments() {
+        assert_eq!(
+            build_agent_args(
+                Agent::Codex,
+                Some("do the thing"),
+                Some("protect the worktree"),
+                false,
+                None,
+            )
+            .unwrap(),
+            vec![
+                "--config",
+                "developer_instructions=\"protect the worktree\"",
+                "do the thing",
+            ]
+        );
+        assert_eq!(
+            build_agent_args(
+                Agent::Codex,
+                None,
+                Some("protect the worktree"),
+                true,
+                Some("019f4918-33a8-7542-96cf-cfcfb2886c75"),
+            )
+            .unwrap(),
+            vec![
+                "--config",
+                "developer_instructions=\"protect the worktree\"",
+                "resume",
+                "019f4918-33a8-7542-96cf-cfcfb2886c75",
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_claude_launch_arguments() {
+        assert_eq!(
+            build_agent_args(
+                Agent::Claude,
+                None,
+                Some("protect the worktree"),
+                true,
+                None,
+            )
+            .unwrap(),
+            vec![
+                "--permission-mode",
+                "acceptEdits",
+                "--continue",
+                "--append-system-prompt",
+                "protect the worktree",
+            ]
+        );
+    }
 }

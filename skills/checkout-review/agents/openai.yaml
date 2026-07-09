@@ -1,0 +1,4 @@
+interface:
+  display_name: "Checkout Review"
+  short_description: "Run a validated multi-angle PR review"
+  default_prompt: "Use $checkout-review to review the current PR and write review.md."
