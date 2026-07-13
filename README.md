@@ -15,6 +15,7 @@ A CLI tool for managing git worktrees with Codex and Claude Code integration. It
 
 Each worktree gets:
 - A unique iTerm2 background color for visual distinction
+- Matching Codex thread and iTerm2 tab names derived from the branch name
 - `node_modules` symlinked from the main repo
 - Claude settings and trust copied over when Claude is selected
 - Worktree safety guidance injected into both agents

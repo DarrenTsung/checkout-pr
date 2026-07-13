@@ -19,6 +19,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -303,8 +304,47 @@ fn reset_iterm_background() {
     std::io::stdout().flush().ok();
 }
 
+fn rename_iterm_session(title: &str) -> Result<(), String> {
+    let iterm_session_id = env::var("ITERM_SESSION_ID")
+        .map_err(|_| "ITERM_SESSION_ID is not set".to_string())?;
+    let session_uuid = iterm_session_id
+        .split_once(':')
+        .map_or(iterm_session_id.as_str(), |(_, uuid)| uuid);
+    let script = r#"
+on run argv
+    set targetSessionId to item 1 of argv
+    set newName to item 2 of argv
+    tell application "iTerm2"
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    if id of s is targetSessionId then
+                        set name of s to newName
+                        return "renamed"
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    error "iTerm2 session not found: " & targetSessionId
+end run
+"#;
+    let output = Command::new("osascript")
+        .args(["-e", script, "--", session_uuid, title])
+        .output()
+        .map_err(|e| format!("Failed to run osascript: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 /// Set iTerm2 session title
 fn set_iterm_title(title: &str) {
+    // Target the exact session as well as writing OSC title sequences. The
+    // latter do not reach iTerm2 from every coding-agent subprocess.
+    let _ = rename_iterm_session(title);
     // OSC 1 sets tab/icon title, OSC 2 sets window title
     // Set both to ensure the title shows
     print!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title);
@@ -313,6 +353,7 @@ fn set_iterm_title(title: &str) {
 
 /// Reset iTerm2 session title
 fn reset_iterm_title() {
+    let _ = rename_iterm_session("");
     print!("\x1b]1;\x07\x1b]2;\x07");
     std::io::stdout().flush().ok();
 }
@@ -472,6 +513,66 @@ fn session_pid_file(worktree_path: &Path) -> PathBuf {
 
 fn session_exited_file(worktree_path: &Path) -> PathBuf {
     get_session_dir().join(format!("{}.exited", session_file_name(worktree_path)))
+}
+
+fn session_name_file(worktree_path: &Path) -> PathBuf {
+    get_session_dir().join(format!("{}.name", session_file_name(worktree_path)))
+}
+
+fn save_session_name(worktree_path: &Path, name: &str) -> Result<(), String> {
+    let dir = get_session_dir();
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create session dir {}: {}", dir.display(), e))?;
+    fs::write(session_name_file(worktree_path), name)
+        .map_err(|e| format!("Failed to save session name: {}", e))
+}
+
+fn read_session_name(worktree_path: &Path) -> Option<String> {
+    let name = fs::read_to_string(session_name_file(worktree_path)).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Convert a git branch into the short, stable name shared by Codex and iTerm.
+/// Branch namespaces such as `darren/` or `dependabot/npm_and_yarn/` are dropped.
+fn session_name_from_branch(branch: &str) -> String {
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    let branch = branch.strip_prefix("origin/").unwrap_or(branch);
+    let leaf = branch.rsplit('/').next().unwrap_or(branch);
+
+    let mut name = String::new();
+    let mut previous_was_separator = false;
+    for character in leaf.chars() {
+        if character.is_ascii_alphanumeric() {
+            name.push(character.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else if !name.is_empty() && !previous_was_separator {
+            name.push('-');
+            previous_was_separator = true;
+        }
+    }
+
+    if name.len() > 25 {
+        let boundary_is_separator = name.as_bytes().get(25) == Some(&b'-');
+        name.truncate(25);
+        if !boundary_is_separator {
+            if let Some(separator) = name.rfind('-') {
+                name.truncate(separator);
+            }
+        }
+    }
+    while name.ends_with('-') {
+        name.pop();
+    }
+    if name.is_empty() {
+        "worktree".to_string()
+    } else {
+        name
+    }
+}
+
+fn session_name_for_resume(worktree_path: &Path, branch_hint: &str) -> String {
+    read_session_name(worktree_path).unwrap_or_else(|| session_name_from_branch(branch_hint))
 }
 
 fn write_session_pid(worktree_path: &Path, pid: u32, agent: Agent) {
@@ -851,9 +952,10 @@ fn run_pr(
     } else {
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
+        let session_name = session_name_from_branch(&pr_details.head_ref_name);
 
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
-        let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", pr_details.head_ref_name));
+        let _iterm_guard = ItermGuard::new(&bg_color, &session_name);
 
         let system_prompt = build_worktree_system_prompt();
 
@@ -870,6 +972,7 @@ fn run_pr(
                 &final_path,
                 Some(&system_prompt),
                 target.resume_id.as_deref(),
+                &session_name,
             )?;
         } else {
             let full_prompt = match chained_skill {
@@ -884,7 +987,13 @@ fn run_pr(
                 full_prompt.cyan()
             );
             println!();
-            spawn_agent_with_prompt(agent, &final_path, &full_prompt, Some(&system_prompt))?;
+            spawn_agent_with_prompt(
+                agent,
+                &final_path,
+                &full_prompt,
+                Some(&system_prompt),
+                &session_name,
+            )?;
         }
     }
 
@@ -985,9 +1094,10 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
     } else {
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
+        let session_name = session_name_from_branch(&branch_name);
 
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
-        let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
+        let _iterm_guard = ItermGuard::new(&bg_color, &session_name);
 
         let system_prompt = build_worktree_system_prompt();
 
@@ -1004,6 +1114,7 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
                 &final_path,
                 Some(&system_prompt),
                 target.resume_id.as_deref(),
+                &session_name,
             )?;
         } else {
             println!();
@@ -1015,9 +1126,15 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
             println!();
 
             if let Some(prompt) = &prompt {
-                spawn_agent_with_prompt(agent, &final_path, prompt, Some(&system_prompt))?;
+                spawn_agent_with_prompt(
+                    agent,
+                    &final_path,
+                    prompt,
+                    Some(&system_prompt),
+                    &session_name,
+                )?;
             } else {
-                spawn_agent(agent, &final_path, Some(&system_prompt))?;
+                spawn_agent(agent, &final_path, Some(&system_prompt), &session_name)?;
             }
         }
     }
@@ -1400,8 +1517,9 @@ fn run_new(no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent:
         } else {
             let bg_color = pick_available_color(&new_path);
             save_worktree_color(&new_path, &bg_color)?;
+            let session_name = session_name_from_branch(&branch_name);
 
-            let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch_name));
+            let _iterm_guard = ItermGuard::new(&bg_color, &session_name);
 
             let system_prompt = build_worktree_system_prompt();
 
@@ -1414,9 +1532,15 @@ fn run_new(no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent:
             println!();
 
             if let Some(prompt) = &prompt {
-                spawn_agent_with_prompt(agent, &new_path, prompt, Some(&system_prompt))?;
+                spawn_agent_with_prompt(
+                    agent,
+                    &new_path,
+                    prompt,
+                    Some(&system_prompt),
+                    &session_name,
+                )?;
             } else {
-                spawn_agent(agent, &new_path, Some(&system_prompt))?;
+                spawn_agent(agent, &new_path, Some(&system_prompt), &session_name)?;
             }
         }
 
@@ -1634,6 +1758,7 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
         if output.status.success() {
             let color_file = worktree_color_file(&wt.path);
             let _ = fs::remove_file(color_file);
+            let _ = fs::remove_file(session_name_file(&wt.path));
             remove_session_pid(&wt.path);
             remove_bazel_output_base(&wt.path);
 
@@ -1676,6 +1801,7 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
                     .output();
                 let color_file = worktree_color_file(&wt.path);
                 let _ = fs::remove_file(color_file);
+                let _ = fs::remove_file(session_name_file(&wt.path));
                 remove_session_pid(&wt.path);
                 remove_bazel_output_base(&wt.path);
 
@@ -2966,11 +3092,245 @@ fn build_worktree_system_prompt() -> String {
         .to_string()
 }
 
+fn codex_session_snapshot(worktree_path: &Path) -> HashMap<String, SystemTime> {
+    let mut files = Vec::new();
+    collect_jsonl_files(&get_codex_session_dir(), &mut files);
+
+    let mut sessions: HashMap<String, SystemTime> = HashMap::new();
+    for path in files {
+        let Some((cwd, session_id)) = codex_session_metadata(&path) else {
+            continue;
+        };
+        if cwd != worktree_path {
+            continue;
+        }
+        let Ok(modified) = fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        sessions
+            .entry(session_id)
+            .and_modify(|current| *current = (*current).max(modified))
+            .or_insert(modified);
+    }
+    sessions
+}
+
+fn wait_for_codex_session_id(
+    worktree_path: &Path,
+    before: &HashMap<String, SystemTime>,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(100);
+    while Instant::now() < deadline {
+        let changed = codex_session_snapshot(worktree_path)
+            .into_iter()
+            .filter(|(session_id, modified)| {
+                before
+                    .get(session_id)
+                    .is_none_or(|previous| modified > previous)
+            })
+            .max_by_key(|(_, modified)| *modified)
+            .map(|(session_id, _)| session_id);
+        if changed.is_some() {
+            return changed;
+        }
+        thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_secs(1));
+    }
+    None
+}
+
+enum CodexRenameWorkerMessage {
+    Started(u32),
+    Finished(Result<(), String>),
+}
+
+fn read_codex_app_server_response(
+    reader: &mut impl BufRead,
+    request_id: u64,
+) -> Result<Value, String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed to read Codex app server response: {}", e))?;
+        if bytes == 0 {
+            return Err(format!(
+                "Codex app server exited before answering request {}",
+                request_id
+            ));
+        }
+        let Ok(response) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if response.get("id").and_then(Value::as_u64) == Some(request_id) {
+            return Ok(response);
+        }
+    }
+}
+
+fn run_codex_rename_worker(
+    app_server_args: Vec<String>,
+    thread_id: String,
+    name: String,
+    messages: mpsc::Sender<CodexRenameWorkerMessage>,
+) -> Result<(), String> {
+    let mut child = Command::new("codex")
+        .args(&app_server_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start codex {}: {}", app_server_args.join(" "), e))?;
+    let _ = messages.send(CodexRenameWorkerMessage::Started(child.id()));
+
+    let result = (|| {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Codex app server stdin was unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Codex app server stdout was unavailable".to_string())?;
+        let mut reader = io::BufReader::new(stdout);
+
+        writeln!(stdin, "{}", serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "checkout",
+                    "title": "Checkout",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        })).map_err(|e| format!("Failed to initialize Codex app server: {}", e))?;
+        stdin.flush()
+            .map_err(|e| format!("Failed to flush Codex initialize request: {}", e))?;
+
+        let initialize = read_codex_app_server_response(&mut reader, 1)?;
+        if let Some(error) = initialize.get("error") {
+            return Err(format!("Codex app server initialize failed: {}", error));
+        }
+
+        writeln!(stdin, "{}", serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialized"
+        })).map_err(|e| format!("Failed to acknowledge Codex initialization: {}", e))?;
+        writeln!(stdin, "{}", serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "thread/name/set",
+            "params": {"threadId": thread_id, "name": name}
+        })).map_err(|e| format!("Failed to send Codex rename request: {}", e))?;
+        stdin.flush()
+            .map_err(|e| format!("Failed to flush Codex rename request: {}", e))?;
+
+        let rename = read_codex_app_server_response(&mut reader, 2)?;
+        if let Some(error) = rename.get("error") {
+            return Err(format!("Codex thread rename failed: {}", error));
+        }
+        Ok(())
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn set_codex_thread_name_with_timeout(
+    app_server_args: &[&str],
+    thread_id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let (worker_sender, receiver) = mpsc::channel();
+    let args = app_server_args.iter().map(|argument| argument.to_string()).collect();
+    let thread_id = thread_id.to_string();
+    let name = name.to_string();
+    thread::spawn(move || {
+        let result = run_codex_rename_worker(args, thread_id, name, worker_sender.clone());
+        let _ = worker_sender.send(CodexRenameWorkerMessage::Finished(result));
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut child_pid: Option<u32> = None;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            if let Some(pid) = child_pid {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+            return Err("Codex app server rename timed out".to_string());
+        };
+        match receiver.recv_timeout(remaining) {
+            Ok(CodexRenameWorkerMessage::Started(pid)) => child_pid = Some(pid),
+            Ok(CodexRenameWorkerMessage::Finished(result)) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(pid) = child_pid {
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+                return Err("Codex app server rename timed out".to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Codex app server rename worker exited".to_string());
+            }
+        }
+    }
+}
+
+fn set_codex_thread_name(thread_id: &str, name: &str) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for args in [
+        &["app-server", "--stdio"][..],
+        &["app-server", "proxy"][..],
+    ] {
+        match set_codex_thread_name_with_timeout(args, thread_id, name) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(format!("codex {}: {}", args.join(" "), error)),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn spawn_codex_thread_renamer(
+    worktree_path: PathBuf,
+    session_name: String,
+    session_id: Option<String>,
+    sessions_before_launch: HashMap<String, SystemTime>,
+) {
+    thread::spawn(move || {
+        let thread_id = session_id.or_else(|| {
+            wait_for_codex_session_id(
+                &worktree_path,
+                &sessions_before_launch,
+                Duration::from_secs(10),
+            )
+        });
+        if let Some(thread_id) = thread_id {
+            // Naming is best-effort: it must never prevent the interactive
+            // coding-agent session from opening.
+            let _ = set_codex_thread_name(&thread_id, &session_name);
+        }
+    });
+}
+
 fn spawn_agent_with_prompt(
     agent: Agent,
     worktree_path: &PathBuf,
     prompt: &str,
     developer_instructions: Option<&str>,
+    session_name: &str,
 ) -> Result<(), String> {
     spawn_agent_process(
         agent,
@@ -2979,6 +3339,7 @@ fn spawn_agent_with_prompt(
         developer_instructions,
         None,
         false,
+        session_name,
     )
 }
 
@@ -2987,6 +3348,7 @@ fn spawn_agent_continue(
     worktree_path: &PathBuf,
     developer_instructions: Option<&str>,
     session_id: Option<&str>,
+    session_name: &str,
 ) -> Result<(), String> {
     spawn_agent_process(
         agent,
@@ -2995,6 +3357,7 @@ fn spawn_agent_continue(
         developer_instructions,
         session_id,
         true,
+        session_name,
     )
 }
 
@@ -3002,8 +3365,17 @@ fn spawn_agent(
     agent: Agent,
     worktree_path: &PathBuf,
     developer_instructions: Option<&str>,
+    session_name: &str,
 ) -> Result<(), String> {
-    spawn_agent_process(agent, worktree_path, None, developer_instructions, None, false)
+    spawn_agent_process(
+        agent,
+        worktree_path,
+        None,
+        developer_instructions,
+        None,
+        false,
+        session_name,
+    )
 }
 
 fn spawn_agent_process(
@@ -3013,8 +3385,16 @@ fn spawn_agent_process(
     developer_instructions: Option<&str>,
     session_id: Option<&str>,
     resume: bool,
+    session_name: &str,
 ) -> Result<(), String> {
     set_terminal_cwd(worktree_path);
+    save_session_name(worktree_path, session_name)?;
+
+    let sessions_before_launch = if agent == Agent::Codex && session_id.is_none() {
+        codex_session_snapshot(worktree_path)
+    } else {
+        HashMap::new()
+    };
 
     let mut cmd = Command::new(agent.command());
     cmd.args(build_agent_args(
@@ -3029,6 +3409,15 @@ fn spawn_agent_process(
         .current_dir(worktree_path)
         .spawn()
         .map_err(|e| format!("Failed to spawn {}: {}", agent.command(), e))?;
+
+    if agent == Agent::Codex {
+        spawn_codex_thread_renamer(
+            worktree_path.clone(),
+            session_name.to_string(),
+            session_id.map(str::to_string),
+            sessions_before_launch,
+        );
+    }
 
     let _pid_guard = PidFileGuard::new(worktree_path, child.id(), agent);
     let status = child
@@ -3382,6 +3771,14 @@ fn find_worktree_resume_target(worktree_path: &Path) -> Option<ResumeTarget> {
     choose_resume_target(codex, claude)
 }
 
+fn find_codex_worktree_session_id(worktree_path: &Path) -> Option<String> {
+    let mut worktree_paths = HashSet::new();
+    worktree_paths.insert(worktree_path.to_path_buf());
+    latest_codex_session_files(&worktree_paths)
+        .remove(worktree_path)
+        .map(|(_, _, session_id)| session_id)
+}
+
 fn parse_codex_session_messages(jsonl_path: &Path, max_messages: usize) -> Vec<ChatMessage> {
     let lines = match tail_lines(jsonl_path, 256 * 1024) {
         Ok(lines) => lines,
@@ -3610,8 +4007,9 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
     prepare_agent_worktree(agent, worktree_path, &repo_root)?;
     let bg_color = pick_available_color(worktree_path);
     save_worktree_color(worktree_path, &bg_color)?;
+    let session_name = session_name_for_resume(worktree_path, &ws.worktree.branch);
 
-    let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", ws.worktree.branch));
+    let _iterm_guard = ItermGuard::new(&bg_color, &session_name);
 
     println!(
         "\n{} Resuming session in {}...\n",
@@ -3625,6 +4023,7 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
         worktree_path,
         Some(&developer_instructions),
         ws.session.resume_id.as_deref(),
+        &session_name,
     )?;
 
     Ok(())
@@ -3703,10 +4102,16 @@ fn run_resume_last(repo: Option<PathBuf>, agent: Agent) -> Result<(), String> {
     prepare_agent_worktree(agent, &worktree_path, &repo_root)?;
     let bg_color = pick_available_color(&worktree_path);
     save_worktree_color(&worktree_path, &bg_color)?;
+    let session_name = session_name_for_resume(&worktree_path, &branch);
 
-    let _iterm_guard = ItermGuard::new(&bg_color, &format!("{} [WORKTREE]", branch));
+    let _iterm_guard = ItermGuard::new(&bg_color, &session_name);
 
     let system_prompt = build_worktree_system_prompt();
+    let resume_id = if agent == Agent::Codex {
+        find_codex_worktree_session_id(&worktree_path)
+    } else {
+        None
+    };
 
     println!();
     println!(
@@ -3716,7 +4121,13 @@ fn run_resume_last(repo: Option<PathBuf>, agent: Agent) -> Result<(), String> {
     );
     println!();
 
-    spawn_agent_continue(agent, &worktree_path, Some(&system_prompt), None)?;
+    spawn_agent_continue(
+        agent,
+        &worktree_path,
+        Some(&system_prompt),
+        resume_id.as_deref(),
+        &session_name,
+    )?;
 
     Ok(())
 }
@@ -4198,6 +4609,20 @@ mod tests {
             "$checkout-pr"
         );
         assert_eq!(normalize_skill(Agent::Claude, "/walkthrough"), "/walkthrough");
+    }
+
+    #[test]
+    fn derives_short_session_names_from_branch_leaves() {
+        assert_eq!(session_name_from_branch("darren/fix_PR-title"), "fix-pr-title");
+        assert_eq!(
+            session_name_from_branch("dependabot/npm_and_yarn/react-19"),
+            "react-19"
+        );
+        assert_eq!(
+            session_name_from_branch("refs/heads/darren/a-very-long-branch-name-that-keeps-going"),
+            "a-very-long-branch-name"
+        );
+        assert_eq!(session_name_from_branch("---"), "worktree");
     }
 
     #[test]
