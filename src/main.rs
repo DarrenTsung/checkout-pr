@@ -267,10 +267,17 @@ struct PrDetails {
     title: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ResumeTarget {
+    last_modified: SystemTime,
+    agent: Agent,
+    resume_id: Option<String>,
+}
+
 #[derive(Debug)]
 enum ExistingWorktreeAction {
     UseExisting,
-    ResumeSession,
+    ResumeSession(ResumeTarget),
     CreateNew,
 }
 
@@ -773,7 +780,7 @@ fn run_pr(
         .or(find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?)
         .or(find_existing_worktree(&repo_root, &format!("[{}]", pr_details.head_ref_name))?);
 
-    let mut resume = false;
+    let mut resume_target = None;
     let mut is_new_worktree = false;
 
     let final_path = if let Some(existing_path) = existing {
@@ -788,11 +795,12 @@ fn run_pr(
             thread::spawn(move || get_uncommitted_status(&path))
         };
 
-        let action = prompt_existing_worktree_action(changes_handle, agent)?;
+        let available_resume = find_worktree_resume_target(&existing_path);
+        let action = prompt_existing_worktree_action(changes_handle, agent, available_resume)?;
 
         match action {
-            ExistingWorktreeAction::ResumeSession => {
-                resume = true;
+            ExistingWorktreeAction::ResumeSession(target) => {
+                resume_target = Some(target);
                 existing_path
             }
             ExistingWorktreeAction::UseExisting => {
@@ -830,14 +838,15 @@ fn run_pr(
         final_path.display().to_string().cyan().bold()
     );
 
-    prepare_agent_worktree(agent, &final_path, &repo_root)?;
+    let launch_agent = resume_target.as_ref().map_or(agent, |target| target.agent);
+    prepare_agent_worktree(launch_agent, &final_path, &repo_root)?;
     if no_agent {
         println!(
             "\n{} Run: {} {} {}",
             "tip:".yellow().bold(),
             "cd".dimmed(),
             final_path.display(),
-            format!("&& {}", agent.command()).dimmed()
+            format!("&& {}", launch_agent.command()).dimmed()
         );
     } else {
         let bg_color = pick_available_color(&final_path);
@@ -848,15 +857,20 @@ fn run_pr(
 
         let system_prompt = build_worktree_system_prompt();
 
-        if resume {
+        if let Some(target) = &resume_target {
             println!();
             println!(
                 "{} Resuming last {} session...",
                 "→".blue().bold(),
-                agent.display_name(),
+                target.agent.display_name(),
             );
             println!();
-            spawn_agent_continue(agent, &final_path, Some(&system_prompt), None)?;
+            spawn_agent_continue(
+                target.agent,
+                &final_path,
+                Some(&system_prompt),
+                target.resume_id.as_deref(),
+            )?;
         } else {
             let full_prompt = match chained_skill {
                 Some(skill) => format!("{} {}\n\nAfter completing the above, run: {}", initial_prompt, pr_number, skill),
@@ -906,7 +920,7 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
     let existing = find_existing_worktree(&repo_root, &format!("branch-{}", slug))?
         .or(find_existing_worktree(&repo_root, &format!("[{}]", branch_name))?);
 
-    let mut resume = false;
+    let mut resume_target = None;
     let mut is_new_worktree = false;
 
     let final_path = if let Some(existing_path) = existing {
@@ -921,11 +935,12 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
             thread::spawn(move || get_uncommitted_status(&path))
         };
 
-        let action = prompt_existing_worktree_action(changes_handle, agent)?;
+        let available_resume = find_worktree_resume_target(&existing_path);
+        let action = prompt_existing_worktree_action(changes_handle, agent, available_resume)?;
 
         match action {
-            ExistingWorktreeAction::ResumeSession => {
-                resume = true;
+            ExistingWorktreeAction::ResumeSession(target) => {
+                resume_target = Some(target);
                 existing_path
             }
             ExistingWorktreeAction::UseExisting => {
@@ -957,14 +972,15 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
         final_path.display().to_string().cyan().bold()
     );
 
-    prepare_agent_worktree(agent, &final_path, &repo_root)?;
+    let launch_agent = resume_target.as_ref().map_or(agent, |target| target.agent);
+    prepare_agent_worktree(launch_agent, &final_path, &repo_root)?;
     if no_agent {
         println!(
             "\n{} Run: {} {} {}",
             "tip:".yellow().bold(),
             "cd".dimmed(),
             final_path.display(),
-            format!("&& {}", agent.command()).dimmed()
+            format!("&& {}", launch_agent.command()).dimmed()
         );
     } else {
         let bg_color = pick_available_color(&final_path);
@@ -975,15 +991,20 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
 
         let system_prompt = build_worktree_system_prompt();
 
-        if resume {
+        if let Some(target) = &resume_target {
             println!();
             println!(
                 "{} Resuming last {} session...",
                 "→".blue().bold(),
-                agent.display_name(),
+                target.agent.display_name(),
             );
             println!();
-            spawn_agent_continue(agent, &final_path, Some(&system_prompt), None)?;
+            spawn_agent_continue(
+                target.agent,
+                &final_path,
+                Some(&system_prompt),
+                target.resume_id.as_deref(),
+            )?;
         } else {
             println!();
             println!(
@@ -2170,21 +2191,45 @@ fn get_uncommitted_status(worktree_path: &PathBuf) -> Result<Option<String>, Str
 
 fn prompt_existing_worktree_action(
     changes_handle: thread::JoinHandle<Result<Option<String>, String>>,
-    agent: Agent,
+    selected_agent: Agent,
+    mut resume_target: Option<ResumeTarget>,
 ) -> Result<ExistingWorktreeAction, String> {
     println!();
-    println!(
-        "  {} Resume last {} session {}",
-        "[1]".cyan().bold(),
-        agent.display_name(),
-        "(keep changes, skip update)".dimmed()
-    );
-    println!("  {} Use existing worktree", "[2]".cyan().bold());
-    println!("  {} Create new worktree", "[3]".cyan().bold());
+    let (use_existing_choice, create_new_choice, valid_choices) = if let Some(target) = &resume_target {
+        println!(
+            "  {} {}",
+            "[1]".cyan().bold(),
+            resume_option_label(selected_agent, target)
+        );
+        println!(
+            "  {} Use existing worktree",
+            "[2]".cyan().bold()
+        );
+        println!(
+            "  {} Create new worktree",
+            "[3]".cyan().bold()
+        );
+        ("2", "3", "1/2/3")
+    } else {
+        println!(
+            "  {} Use existing worktree {}",
+            "[1]".cyan().bold(),
+            "(no session found to resume)".dimmed()
+        );
+        println!(
+            "  {} Create new worktree",
+            "[2]".cyan().bold()
+        );
+        ("1", "2", "1/2")
+    };
     println!();
 
     loop {
-        print!("{} Choose an option [1/2/3]: ", "?".magenta().bold());
+        print!(
+            "{} Choose an option [{}]: ",
+            "?".magenta().bold(),
+            valid_choices
+        );
         io::stdout().flush().map_err(|e| e.to_string())?;
 
         let mut input = String::new();
@@ -2193,8 +2238,12 @@ fn prompt_existing_worktree_action(
             .map_err(|e| format!("Failed to read input: {}", e))?;
 
         match input.trim() {
-            "1" => return Ok(ExistingWorktreeAction::ResumeSession),
-            "2" => {
+            "1" if resume_target.is_some() => {
+                return Ok(ExistingWorktreeAction::ResumeSession(
+                    resume_target.take().unwrap(),
+                ));
+            }
+            choice if choice == use_existing_choice => {
                 let status = changes_handle
                     .join()
                     .map_err(|_| "Failed to check git status".to_string())??;
@@ -2244,15 +2293,30 @@ fn prompt_existing_worktree_action(
                 }
                 return Ok(ExistingWorktreeAction::UseExisting);
             }
-            "3" => return Ok(ExistingWorktreeAction::CreateNew),
+            choice if choice == create_new_choice => return Ok(ExistingWorktreeAction::CreateNew),
             _ => {
                 println!(
                     "{} Invalid option, please enter {}",
                     "!".red().bold(),
-                    "1, 2, or 3"
+                    valid_choices.replace('/', ", ")
                 );
             }
         }
+    }
+}
+
+fn resume_option_label(selected_agent: Agent, target: &ResumeTarget) -> String {
+    if selected_agent == target.agent {
+        format!(
+            "Resume last {} session (keep changes, skip update)",
+            target.agent.display_name()
+        )
+    } else {
+        format!(
+            "Resume last {} session (switch from selected {}; keep changes, skip update)",
+            target.agent.display_name(),
+            selected_agent.display_name()
+        )
     }
 }
 
@@ -3280,6 +3344,44 @@ fn latest_codex_session_files(
     latest
 }
 
+fn choose_resume_target(
+    codex: Option<ResumeTarget>,
+    claude: Option<ResumeTarget>,
+) -> Option<ResumeTarget> {
+    match (codex, claude) {
+        (Some(codex), Some(claude)) => {
+            if codex.last_modified >= claude.last_modified {
+                Some(codex)
+            } else {
+                Some(claude)
+            }
+        }
+        (Some(codex), None) => Some(codex),
+        (None, Some(claude)) => Some(claude),
+        (None, None) => None,
+    }
+}
+
+fn find_worktree_resume_target(worktree_path: &Path) -> Option<ResumeTarget> {
+    let claude = find_claude_worktree_session_time(worktree_path).map(|last_modified| ResumeTarget {
+        last_modified,
+        agent: Agent::Claude,
+        resume_id: None,
+    });
+
+    let mut worktree_paths = HashSet::new();
+    worktree_paths.insert(worktree_path.to_path_buf());
+    let codex = latest_codex_session_files(&worktree_paths)
+        .remove(worktree_path)
+        .map(|(last_modified, _, resume_id)| ResumeTarget {
+            last_modified,
+            agent: Agent::Codex,
+            resume_id: Some(resume_id),
+        });
+
+    choose_resume_target(codex, claude)
+}
+
 fn parse_codex_session_messages(jsonl_path: &Path, max_messages: usize) -> Vec<ChatMessage> {
     let lines = match tail_lines(jsonl_path, 256 * 1024) {
         Ok(lines) => lines,
@@ -4254,6 +4356,48 @@ mod tests {
                 "--append-system-prompt",
                 "protect the worktree",
             ]
+        );
+    }
+
+    #[test]
+    fn resume_target_uses_the_most_recent_sessions_agent() {
+        let older_codex = ResumeTarget {
+            last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            agent: Agent::Codex,
+            resume_id: Some("codex-session".to_string()),
+        };
+        let newer_claude = ResumeTarget {
+            last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            agent: Agent::Claude,
+            resume_id: None,
+        };
+
+        assert_eq!(
+            choose_resume_target(Some(older_codex), Some(newer_claude)),
+            Some(ResumeTarget {
+                last_modified: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+                agent: Agent::Claude,
+                resume_id: None,
+            })
+        );
+        assert_eq!(choose_resume_target(None, None), None);
+    }
+
+    #[test]
+    fn cross_agent_resume_option_requests_explicit_approval() {
+        let target = ResumeTarget {
+            last_modified: SystemTime::UNIX_EPOCH,
+            agent: Agent::Claude,
+            resume_id: None,
+        };
+
+        assert_eq!(
+            resume_option_label(Agent::Codex, &target),
+            "Resume last Claude session (switch from selected Codex; keep changes, skip update)"
+        );
+        assert_eq!(
+            resume_option_label(Agent::Claude, &target),
+            "Resume last Claude session (keep changes, skip update)"
         );
     }
 }
