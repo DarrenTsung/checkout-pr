@@ -19,7 +19,7 @@ Each worktree gets:
 - `node_modules` symlinked from the main repo
 - Claude settings and trust copied over when Claude is selected
 - Worktree safety guidance injected into both agents
-- `mise trust` run automatically (if mise is installed)
+- `mise trust` completed before the agent starts (if mise is installed), including for recycled worktrees
 
 ## Install
 

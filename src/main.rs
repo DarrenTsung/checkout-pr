@@ -927,7 +927,7 @@ fn run_pr(
     };
 
     let bg_handle = if is_new_worktree {
-        Some(spawn_background_setup(final_path.clone(), repo_root.clone()))
+        Some(start_new_worktree_setup(final_path.clone(), repo_root.clone())?)
     } else {
         None
     };
@@ -1069,7 +1069,7 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
     };
 
     let bg_handle = if is_new_worktree {
-        Some(spawn_background_setup(final_path.clone(), repo_root.clone()))
+        Some(start_new_worktree_setup(final_path.clone(), repo_root.clone())?)
     } else {
         None
     };
@@ -1498,6 +1498,8 @@ fn run_new(no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent:
         let new_metadata_name = format!("branch-{}", workspace_name);
         rename_worktree_metadata(&new_path, &new_metadata_name)?;
 
+        let bg_handle = start_new_worktree_setup(new_path.clone(), repo_root.clone())?;
+
         println!();
         println!(
             "{} Worktree ready at {}",
@@ -1543,6 +1545,8 @@ fn run_new(no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent:
                 spawn_agent(agent, &new_path, Some(&system_prompt), &session_name)?;
             }
         }
+
+        let _ = bg_handle.join();
 
         return Ok(());
     }
@@ -2193,20 +2197,27 @@ fn run_clean(repo: Option<PathBuf>, skip_confirm: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Spawn non-critical worktree setup steps in the background so Claude can
-/// start sooner. Runs `mise trust` (if available) and `symlink_node_modules`.
-/// Errors are logged to stderr but otherwise ignored.
+/// Trust mise configs before the agent starts, then run non-critical setup in
+/// the background. Trust is path-based, so this must also run after an idle
+/// worktree is moved to a new workspace path.
+fn start_new_worktree_setup(
+    worktree_path: PathBuf,
+    repo_root: PathBuf,
+) -> Result<thread::JoinHandle<()>, String> {
+    if which_mise().is_some() {
+        run_mise_trust(&worktree_path)?;
+    }
+
+    Ok(spawn_background_setup(worktree_path, repo_root))
+}
+
+/// Spawn non-critical worktree setup steps in the background so the agent can
+/// start sooner. Errors are logged to stderr but otherwise ignored.
 fn spawn_background_setup(
     worktree_path: PathBuf,
     repo_root: PathBuf,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        if which_mise().is_some() {
-            if let Err(e) = run_mise_trust(&worktree_path) {
-                eprintln!("background: mise trust failed: {}", e);
-            }
-        }
-
         if let Err(e) = symlink_node_modules(&worktree_path, &repo_root) {
             eprintln!("background: symlink_node_modules failed: {}", e);
         }
