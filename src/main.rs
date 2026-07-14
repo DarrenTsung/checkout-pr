@@ -167,6 +167,28 @@ enum Commands {
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
+
+        /// Resume the existing worktree session without prompting
+        #[arg(long)]
+        resume_existing: bool,
+    },
+    /// Open a resource in its existing iTerm session or a new checkout tab
+    Open {
+        #[command(subcommand)]
+        target: OpenTarget,
+    },
+    /// Open a persistent worktree for a Statsig gate
+    Statsig {
+        /// Statsig gate name
+        gate: String,
+
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Resume the existing worktree session without prompting
+        #[arg(long)]
+        resume_existing: bool,
     },
     /// Check out a GitHub PR into a worktree and generate a walkthrough
     Walkthrough {
@@ -258,6 +280,36 @@ enum Commands {
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum OpenTarget {
+    /// Open a GitHub PR worktree
+    Pr {
+        /// PR number or GitHub PR URL
+        pr: String,
+
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Print a machine-readable result
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a Statsig gate worktree
+    Statsig {
+        /// Statsig gate name
+        gate: String,
+
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Print a machine-readable result
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -769,11 +821,16 @@ fn run() -> Result<(), String> {
     }
 
     match cli.command {
-        Commands::Pr { pr, no_agent, repo, skill } => {
+        Commands::Pr { pr, no_agent, repo, skill, resume_existing } => {
             let initial_skill = agent.skill("/checkout:checkout-pr", "$checkout-pr");
             let chained_skill = skill.as_deref().map(|skill| normalize_skill(agent, skill));
-            run_pr(&pr, no_agent, repo, initial_skill, chained_skill.as_deref(), agent)
+            run_pr(&pr, no_agent, repo, initial_skill, chained_skill.as_deref(), agent, resume_existing)
         },
+        Commands::Open { target } => match target {
+            OpenTarget::Pr { pr, repo, json } => run_open_pr(&pr, repo, json, agent),
+            OpenTarget::Statsig { gate, repo, json } => run_open_statsig(&gate, repo, json, agent),
+        },
+        Commands::Statsig { gate, repo, resume_existing } => run_statsig(&gate, repo, agent, resume_existing),
         Commands::Walkthrough { pr, no_agent, repo } => run_pr(
             &pr,
             no_agent,
@@ -781,6 +838,7 @@ fn run() -> Result<(), String> {
             agent.skill("/checkout:checkout-pr", "$checkout-pr"),
             Some(agent.skill("/walkthrough", "$walkthrough")),
             agent,
+            false,
         ),
         Commands::Review { pr, no_agent, repo } => run_pr(
             &pr,
@@ -789,10 +847,11 @@ fn run() -> Result<(), String> {
             agent.skill("/checkout:checkout-and-review-pr", "$checkout-and-review-pr"),
             None,
             agent,
+            false,
         ),
         Commands::Branch { name, no_agent, prompt, repo } => {
             let prompt = read_prompt_file(prompt)?;
-            run_branch(&name, no_agent, prompt, repo, agent)
+            run_branch(&name, no_agent, prompt, repo, agent, false)
         },
         Commands::New { no_agent, prompt, repo } => {
             let prompt = read_prompt_file(prompt)?;
@@ -832,6 +891,165 @@ fn read_prompt_file(path: Option<PathBuf>) -> Result<Option<String>, String> {
     }
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn statsig_slug(gate: &str) -> String {
+    let mut slug = gate
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() { character.to_ascii_lowercase() } else { '-' })
+        .collect::<String>();
+    slug = Regex::new(r"-+").unwrap().replace_all(&slug, "-").trim_matches('-').to_string();
+    if slug.is_empty() {
+        slug = "gate".to_string();
+    }
+    if slug.len() > 17 {
+        let digest = format!("{:x}", md5::compute(gate.as_bytes()));
+        slug.truncate(10);
+        while slug.ends_with('-') {
+            slug.pop();
+        }
+        slug.push('-');
+        slug.push_str(&digest[..6]);
+    }
+    slug
+}
+
+fn statsig_branch_name(gate: &str) -> String {
+    format!("darren/statsig-{}", statsig_slug(gate))
+}
+
+fn checkout_launch_command(
+    resource: &str,
+    identifier: &str,
+    repo_root: &Path,
+    agent: Agent,
+) -> Result<String, String> {
+    let executable = env::current_exe()
+        .map_err(|error| format!("Failed to locate checkout executable: {}", error))?;
+    Ok([
+        shell_quote(&executable.to_string_lossy()),
+        resource.to_string(),
+        shell_quote(identifier),
+        "--resume-existing".to_string(),
+        "--repo".to_string(),
+        shell_quote(&repo_root.to_string_lossy()),
+        "--agent".to_string(),
+        agent.command().to_string(),
+    ].join(" "))
+}
+
+fn focus_or_open_iterm(
+    session_name: &str,
+    legacy_prefix: Option<&str>,
+    launch_command: &str,
+) -> Result<String, String> {
+    let script = r#"
+on run argv
+    set targetName to item 1 of argv
+    set legacyPrefix to item 2 of argv
+    set launchCommand to item 3 of argv
+    tell application "iTerm2"
+        repeat with candidateWindow in windows
+            repeat with candidateTab in tabs of candidateWindow
+                repeat with candidateSession in sessions of candidateTab
+                    set candidateName to name of candidateSession
+                    if candidateName is targetName or (legacyPrefix is not "" and candidateName starts with legacyPrefix) then
+                        select candidateSession
+                        select candidateTab
+                        select candidateWindow
+                        activate
+                        return "focused"
+                    end if
+                end repeat
+            end repeat
+        end repeat
+
+        if (count of windows) is 0 then
+            set targetWindow to (create window with default profile)
+            set targetSession to current session of targetWindow
+        else
+            set targetWindow to current window
+            tell targetWindow
+                set targetTab to (create tab with default profile)
+            end tell
+            set targetSession to current session of targetTab
+        end if
+        tell targetSession to write text launchCommand
+        activate
+        return "opened"
+    end tell
+end run
+"#;
+    let output = Command::new("osascript")
+        .args(["-e", script, "--", session_name, legacy_prefix.unwrap_or(""), launch_command])
+        .output()
+        .map_err(|error| format!("Failed to run osascript: {}", error))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn print_open_result(json: bool, action: &str, resource: &str, identifier: &str, session_name: &str) {
+    if json {
+        println!("{}", serde_json::json!({
+            "action": action,
+            "resourceType": resource,
+            "resourceId": identifier,
+            "sessionName": session_name,
+        }));
+    } else {
+        let verb = if action == "focused" { "Focused" } else { "Opened" };
+        println!("{} {} {} in iTerm", "→".blue().bold(), verb, session_name.cyan());
+    }
+}
+
+fn run_open_pr(pr: &str, repo: Option<PathBuf>, json: bool, agent: Agent) -> Result<(), String> {
+    let pr_number = extract_pr_number(pr)?;
+    let repo_root = repo.unwrap_or_else(default_repo_root);
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+    let details = fetch_pr_details(pr_number, &repo_root)?;
+    let session_name = session_name_from_branch(&details.head_ref_name);
+    let command = checkout_launch_command("pr", &pr_number.to_string(), &repo_root, agent)?;
+    let legacy_prefix = format!("pr-{}-", pr_number);
+    let action = focus_or_open_iterm(&session_name, Some(&legacy_prefix), &command)?;
+    print_open_result(json, &action, "pr", &pr_number.to_string(), &session_name);
+    Ok(())
+}
+
+fn run_open_statsig(gate: &str, repo: Option<PathBuf>, json: bool, agent: Agent) -> Result<(), String> {
+    let gate = gate.trim();
+    if gate.is_empty() {
+        return Err("Statsig gate name is required".to_string());
+    }
+    let repo_root = repo.unwrap_or_else(default_repo_root);
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+    let branch = statsig_branch_name(gate);
+    let session_name = session_name_from_branch(&branch);
+    let command = checkout_launch_command("statsig", gate, &repo_root, agent)?;
+    let action = focus_or_open_iterm(&session_name, None, &command)?;
+    print_open_result(json, &action, "statsig", gate, &session_name);
+    Ok(())
+}
+
+fn run_statsig(gate: &str, repo: Option<PathBuf>, agent: Agent, resume_existing: bool) -> Result<(), String> {
+    let gate = gate.trim();
+    if gate.is_empty() {
+        return Err("Statsig gate name is required".to_string());
+    }
+    let prompt = format!(
+        "Use $statsig-cli to inspect the Statsig gate `{}` and continue the rollout or investigation associated with it. Verify the current gate state and recent history before recommending or making changes.",
+        gate,
+    );
+    run_branch(&statsig_branch_name(gate), false, Some(prompt), repo, agent, resume_existing)
+}
+
 fn run_pr(
     pr: &str,
     no_agent: bool,
@@ -839,6 +1057,7 @@ fn run_pr(
     initial_prompt: &str,
     chained_skill: Option<&str>,
     agent: Agent,
+    resume_existing: bool,
 ) -> Result<(), String> {
     timing!("run_pr");
     let pr_number = extract_pr_number(pr)?;
@@ -891,13 +1110,18 @@ fn run_pr(
             existing_path.display().to_string().cyan()
         );
 
-        let changes_handle = {
-            let path = existing_path.clone();
-            thread::spawn(move || get_uncommitted_status(&path))
-        };
-
         let available_resume = find_worktree_resume_target(&existing_path);
-        let action = prompt_existing_worktree_action(changes_handle, agent, available_resume)?;
+        let action = if resume_existing {
+            available_resume
+                .map(ExistingWorktreeAction::ResumeSession)
+                .unwrap_or(ExistingWorktreeAction::UseExisting)
+        } else {
+            let changes_handle = {
+                let path = existing_path.clone();
+                thread::spawn(move || get_uncommitted_status(&path))
+            };
+            prompt_existing_worktree_action(changes_handle, agent, available_resume)?
+        };
 
         match action {
             ExistingWorktreeAction::ResumeSession(target) => {
@@ -905,11 +1129,13 @@ fn run_pr(
                 existing_path
             }
             ExistingWorktreeAction::UseExisting => {
-                print!("{} Updating to latest... ", "→".blue().bold());
-                std::io::stdout().flush().ok();
-                match update_worktree(&existing_path, &pr_details.head_ref_name) {
-                    Ok(()) => println!("{}", "done".green()),
-                    Err(e) => println!("{}\n  {} {}", "skipped".yellow(), "⚠".yellow().bold(), e.dimmed()),
+                if !resume_existing {
+                    print!("{} Updating to latest... ", "→".blue().bold());
+                    std::io::stdout().flush().ok();
+                    match update_worktree(&existing_path, &pr_details.head_ref_name) {
+                        Ok(()) => println!("{}", "done".green()),
+                        Err(e) => println!("{}\n  {} {}", "skipped".yellow(), "⚠".yellow().bold(), e.dimmed()),
+                    }
                 }
                 existing_path
             }
@@ -1004,7 +1230,14 @@ fn run_pr(
     Ok(())
 }
 
-fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent: Agent) -> Result<(), String> {
+fn run_branch(
+    name: &str,
+    no_agent: bool,
+    prompt: Option<String>,
+    repo: Option<PathBuf>,
+    agent: Agent,
+    resume_existing: bool,
+) -> Result<(), String> {
     timing!("run_branch");
     let branch_name = name.to_string();
 
@@ -1039,13 +1272,18 @@ fn run_branch(name: &str, no_agent: bool, prompt: Option<String>, repo: Option<P
             existing_path.display().to_string().cyan()
         );
 
-        let changes_handle = {
-            let path = existing_path.clone();
-            thread::spawn(move || get_uncommitted_status(&path))
-        };
-
         let available_resume = find_worktree_resume_target(&existing_path);
-        let action = prompt_existing_worktree_action(changes_handle, agent, available_resume)?;
+        let action = if resume_existing {
+            available_resume
+                .map(ExistingWorktreeAction::ResumeSession)
+                .unwrap_or(ExistingWorktreeAction::UseExisting)
+        } else {
+            let changes_handle = {
+                let path = existing_path.clone();
+                thread::spawn(move || get_uncommitted_status(&path))
+            };
+            prompt_existing_worktree_action(changes_handle, agent, available_resume)?
+        };
 
         match action {
             ExistingWorktreeAction::ResumeSession(target) => {
@@ -1561,7 +1799,7 @@ fn run_new(no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent:
         workspace_name.cyan()
     );
 
-    run_branch(&branch_name, no_agent, prompt, repo, agent)
+    run_branch(&branch_name, no_agent, prompt, repo, agent, false)
 }
 
 #[derive(Clone)]
@@ -4587,6 +4825,56 @@ mod tests {
         let cli = Cli::try_parse_from(["checkout", "new", "--no-agent"]).unwrap();
         assert_eq!(cli.agent, Agent::Codex);
         assert!(matches!(cli.command, Commands::New { no_agent: true, .. }));
+    }
+
+    #[test]
+    fn parses_noninteractive_resource_open_commands() {
+        let cli = Cli::try_parse_from([
+            "checkout",
+            "open",
+            "pr",
+            "830562",
+            "--repo",
+            "/tmp/figma",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Open {
+                target: OpenTarget::Pr { pr, json: true, .. }
+            } if pr == "830562"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "checkout",
+            "open",
+            "statsig",
+            "my_gate",
+            "--repo",
+            "/tmp/figma",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Open {
+                target: OpenTarget::Statsig { gate, json: true, .. }
+            } if gate == "my_gate"
+        ));
+    }
+
+    #[test]
+    fn statsig_worktrees_are_stable_and_shell_arguments_are_quoted() {
+        assert_eq!(
+            statsig_branch_name("my_gate"),
+            "darren/statsig-my-gate"
+        );
+        assert_eq!(shell_quote("gate with ' quote"), "'gate with '\"'\"' quote'");
+        let long = statsig_branch_name("this_is_a_very_long_gate_name_that_needs_a_stable_hash_suffix");
+        assert!(long.starts_with("darren/statsig-this-is-a-"));
+        assert!(session_name_from_branch(&long).len() <= 25);
+        assert!(Regex::new(r"-[0-9a-f]{6}$").unwrap().is_match(&long));
     }
 
     #[test]

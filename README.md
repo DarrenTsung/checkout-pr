@@ -5,6 +5,8 @@ A CLI tool for managing git worktrees with Codex and Claude Code integration. It
 ## Features
 
 - **`checkout pr <number|url>`** — Check out a GitHub PR into a worktree
+- **`checkout statsig <gate>`** — Open a persistent gate-specific worktree and Codex session
+- **`checkout open pr|statsig <id>`** — Focus a matching iTerm tab or open one that resumes/creates the resource session
 - **`checkout review <number|url>`** — Check out a PR and start a code review
 - **`checkout branch <name>`** — Create a new branch in a worktree
 - **`checkout new`** — Create or recycle a randomly named worktree
@@ -50,6 +52,7 @@ This adds a shell function that builds from source on each invocation and links 
 | `--no-agent` | Skip launching an agent after creating the worktree |
 | `--prompt <file>` | Use file contents as the initial agent prompt (`branch` and `new`) |
 | `--repo <path>` | Override the repo path |
+| `--resume-existing` | Resume an existing worktree session without prompting (`pr` and `statsig`) |
 | `-y` | Skip confirmation in `clean` |
 
 `--no-claude` and `--claude-prompt` remain accepted as compatibility aliases for `--no-agent` and `--prompt`.
@@ -60,6 +63,8 @@ Examples:
 checkout new                         # Codex
 checkout new --agent claude          # Claude Code
 checkout resume                      # browse Codex and Claude sessions
+checkout open pr 830562              # focus, resume, or create the PR session
+checkout open statsig my_gate        # focus, resume, or create the gate session
 ```
 
 ## Requirements
