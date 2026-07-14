@@ -571,6 +571,67 @@ fn session_name_file(worktree_path: &Path) -> PathBuf {
     get_session_dir().join(format!("{}.name", session_file_name(worktree_path)))
 }
 
+fn worktree_iterm_session_file(worktree_path: &Path) -> PathBuf {
+    let digest = format!("{:x}", md5::compute(worktree_path.to_string_lossy().as_bytes()));
+    get_session_dir().join(format!("worktree-{}.iterm", digest))
+}
+
+fn resource_iterm_session_file(resource: &str, identifier: &str, repo_root: &Path) -> PathBuf {
+    let key = format!("{}:{}:{}", repo_root.display(), resource, identifier);
+    let digest = format!("{:x}", md5::compute(key.as_bytes()));
+    get_session_dir().join(format!("resource-{}.iterm", digest))
+}
+
+fn normalized_iterm_session_id(value: &str) -> Option<String> {
+    let id = value.rsplit_once(':').map_or(value, |(_, id)| id).trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+fn save_iterm_session_id(path: PathBuf, session_id: &str) -> Result<(), String> {
+    let session_id = normalized_iterm_session_id(session_id)
+        .ok_or_else(|| "iTerm session ID is empty".to_string())?;
+    let dir = get_session_dir();
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create session dir {}: {}", dir.display(), error))?;
+    fs::write(path, session_id)
+        .map_err(|error| format!("Failed to save iTerm session ID: {}", error))
+}
+
+fn read_iterm_session_id(path: PathBuf) -> Option<String> {
+    normalized_iterm_session_id(&fs::read_to_string(path).ok()?)
+}
+
+fn save_worktree_iterm_session(worktree_path: &Path, session_id: &str) -> Result<(), String> {
+    save_iterm_session_id(worktree_iterm_session_file(worktree_path), session_id)
+}
+
+fn read_worktree_iterm_session(worktree_path: &Path) -> Option<String> {
+    read_iterm_session_id(worktree_iterm_session_file(worktree_path))
+}
+
+fn save_resource_iterm_session(
+    resource: &str,
+    identifier: &str,
+    repo_root: &Path,
+    session_id: &str,
+) -> Result<(), String> {
+    save_iterm_session_id(
+        resource_iterm_session_file(resource, identifier, repo_root),
+        session_id,
+    )
+}
+
+fn read_resource_iterm_session(resource: &str, identifier: &str, repo_root: &Path) -> Option<String> {
+    read_iterm_session_id(resource_iterm_session_file(resource, identifier, repo_root))
+}
+
+fn record_current_iterm_session(worktree_path: &Path) -> Result<(), String> {
+    let Ok(session_id) = env::var("ITERM_SESSION_ID") else {
+        return Ok(());
+    };
+    save_worktree_iterm_session(worktree_path, &session_id)
+}
+
 fn save_session_name(worktree_path: &Path, name: &str) -> Result<(), String> {
     let dir = get_session_dir();
     fs::create_dir_all(&dir)
@@ -940,17 +1001,41 @@ fn checkout_launch_command(
     ].join(" "))
 }
 
+struct ItermOpenResult {
+    action: String,
+    session_id: String,
+}
+
 fn focus_or_open_iterm(
+    resource_session_id: Option<&str>,
+    worktree_session_id: Option<&str>,
     session_name: &str,
     legacy_prefix: Option<&str>,
     launch_command: &str,
-) -> Result<String, String> {
+) -> Result<ItermOpenResult, String> {
     let script = r#"
 on run argv
-    set targetName to item 1 of argv
-    set legacyPrefix to item 2 of argv
-    set launchCommand to item 3 of argv
+    set resourceSessionId to item 1 of argv
+    set worktreeSessionId to item 2 of argv
+    set targetName to item 3 of argv
+    set legacyPrefix to item 4 of argv
+    set launchCommand to item 5 of argv
     tell application "iTerm2"
+        repeat with candidateWindow in windows
+            repeat with candidateTab in tabs of candidateWindow
+                repeat with candidateSession in sessions of candidateTab
+                    set candidateId to id of candidateSession as text
+                    if (resourceSessionId is not "" and candidateId is resourceSessionId) or (worktreeSessionId is not "" and candidateId is worktreeSessionId) then
+                        select candidateSession
+                        select candidateTab
+                        select candidateWindow
+                        activate
+                        return "focused|" & candidateId
+                    end if
+                end repeat
+            end repeat
+        end repeat
+
         repeat with candidateWindow in windows
             repeat with candidateTab in tabs of candidateWindow
                 repeat with candidateSession in sessions of candidateTab
@@ -960,7 +1045,7 @@ on run argv
                         select candidateTab
                         select candidateWindow
                         activate
-                        return "focused"
+                        return "focused|" & (id of candidateSession as text)
                     end if
                 end repeat
             end repeat
@@ -978,18 +1063,34 @@ on run argv
         end if
         tell targetSession to write text launchCommand
         activate
-        return "opened"
+        return "opened|" & (id of targetSession as text)
     end tell
 end run
 "#;
     let output = Command::new("osascript")
-        .args(["-e", script, "--", session_name, legacy_prefix.unwrap_or(""), launch_command])
+        .args([
+            "-e",
+            script,
+            "--",
+            resource_session_id.unwrap_or(""),
+            worktree_session_id.unwrap_or(""),
+            session_name,
+            legacy_prefix.unwrap_or(""),
+            launch_command,
+        ])
         .output()
         .map_err(|error| format!("Failed to run osascript: {}", error))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (action, session_id) = stdout
+        .trim()
+        .split_once('|')
+        .ok_or_else(|| format!("iTerm returned an invalid open result: {}", stdout.trim()))?;
+    let session_id = normalized_iterm_session_id(session_id)
+        .ok_or_else(|| "iTerm returned an empty session ID".to_string())?;
+    Ok(ItermOpenResult { action: action.to_string(), session_id })
 }
 
 fn print_open_result(json: bool, action: &str, resource: &str, identifier: &str, session_name: &str) {
@@ -1006,6 +1107,23 @@ fn print_open_result(json: bool, action: &str, resource: &str, identifier: &str,
     }
 }
 
+fn find_pr_worktree(
+    repo_root: &PathBuf,
+    pr_number: u64,
+    branch: &str,
+) -> Result<Option<PathBuf>, String> {
+    let branch_slug = branch.rsplit('/').next().unwrap_or(branch);
+    Ok(find_existing_worktree(repo_root, &format!("branch-{}", branch_slug))?
+        .or(find_existing_worktree(repo_root, &format!("pr-{}-", pr_number))?)
+        .or(find_existing_worktree(repo_root, &format!("[{}]", branch))?))
+}
+
+fn find_branch_worktree(repo_root: &PathBuf, branch: &str) -> Result<Option<PathBuf>, String> {
+    let slug = branch.rsplit('/').next().unwrap_or(branch);
+    Ok(find_existing_worktree(repo_root, &format!("branch-{}", slug))?
+        .or(find_existing_worktree(repo_root, &format!("[{}]", branch))?))
+}
+
 fn run_open_pr(pr: &str, repo: Option<PathBuf>, json: bool, agent: Agent) -> Result<(), String> {
     let pr_number = extract_pr_number(pr)?;
     let repo_root = repo.unwrap_or_else(default_repo_root);
@@ -1014,10 +1132,24 @@ fn run_open_pr(pr: &str, repo: Option<PathBuf>, json: bool, agent: Agent) -> Res
     }
     let details = fetch_pr_details(pr_number, &repo_root)?;
     let session_name = session_name_from_branch(&details.head_ref_name);
-    let command = checkout_launch_command("pr", &pr_number.to_string(), &repo_root, agent)?;
+    let identifier = pr_number.to_string();
+    let existing_worktree = find_pr_worktree(&repo_root, pr_number, &details.head_ref_name)?;
+    let resource_session_id = read_resource_iterm_session("pr", &identifier, &repo_root);
+    let worktree_session_id = existing_worktree.as_deref().and_then(read_worktree_iterm_session);
+    let command = checkout_launch_command("pr", &identifier, &repo_root, agent)?;
     let legacy_prefix = format!("pr-{}-", pr_number);
-    let action = focus_or_open_iterm(&session_name, Some(&legacy_prefix), &command)?;
-    print_open_result(json, &action, "pr", &pr_number.to_string(), &session_name);
+    let result = focus_or_open_iterm(
+        resource_session_id.as_deref(),
+        worktree_session_id.as_deref(),
+        &session_name,
+        Some(&legacy_prefix),
+        &command,
+    )?;
+    save_resource_iterm_session("pr", &identifier, &repo_root, &result.session_id)?;
+    if let Some(worktree) = existing_worktree {
+        save_worktree_iterm_session(&worktree, &result.session_id)?;
+    }
+    print_open_result(json, &result.action, "pr", &identifier, &session_name);
     Ok(())
 }
 
@@ -1032,9 +1164,22 @@ fn run_open_statsig(gate: &str, repo: Option<PathBuf>, json: bool, agent: Agent)
     }
     let branch = statsig_branch_name(gate);
     let session_name = session_name_from_branch(&branch);
+    let existing_worktree = find_branch_worktree(&repo_root, &branch)?;
+    let resource_session_id = read_resource_iterm_session("statsig", gate, &repo_root);
+    let worktree_session_id = existing_worktree.as_deref().and_then(read_worktree_iterm_session);
     let command = checkout_launch_command("statsig", gate, &repo_root, agent)?;
-    let action = focus_or_open_iterm(&session_name, None, &command)?;
-    print_open_result(json, &action, "statsig", gate, &session_name);
+    let result = focus_or_open_iterm(
+        resource_session_id.as_deref(),
+        worktree_session_id.as_deref(),
+        &session_name,
+        None,
+        &command,
+    )?;
+    save_resource_iterm_session("statsig", gate, &repo_root, &result.session_id)?;
+    if let Some(worktree) = existing_worktree {
+        save_worktree_iterm_session(&worktree, &result.session_id)?;
+    }
+    print_open_result(json, &result.action, "statsig", gate, &session_name);
     Ok(())
 }
 
@@ -1093,12 +1238,7 @@ fn run_pr(
     let worktree_dir = default_worktree_dir();
     let worktree_path = worktree_dir.join(format!("pr-{}-{}", pr_number, slug));
 
-    // Check for an existing worktree by branch name first (from `checkout branch`), then PR prefix,
-    // then by checked-out branch (covers `checkout new` worktrees with random names)
-    let branch_slug = pr_details.head_ref_name.rsplit('/').next().unwrap_or(&pr_details.head_ref_name);
-    let existing = find_existing_worktree(&repo_root, &format!("branch-{}", branch_slug))?
-        .or(find_existing_worktree(&repo_root, &format!("pr-{}-", pr_number))?)
-        .or(find_existing_worktree(&repo_root, &format!("[{}]", pr_details.head_ref_name))?);
+    let existing = find_pr_worktree(&repo_root, pr_number, &pr_details.head_ref_name)?;
 
     let mut resume_target = None;
     let mut is_new_worktree = false;
@@ -1178,6 +1318,7 @@ fn run_pr(
     } else {
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
+        record_current_iterm_session(&final_path)?;
         let session_name = session_name_from_branch(&pr_details.head_ref_name);
 
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
@@ -1258,9 +1399,7 @@ fn run_branch(
     let worktree_dir = default_worktree_dir();
     let worktree_path = worktree_dir.join(format!("branch-{}", slug));
 
-    // Check for an existing worktree by branch directory name or by git branch ref (from `checkout pr`)
-    let existing = find_existing_worktree(&repo_root, &format!("branch-{}", slug))?
-        .or(find_existing_worktree(&repo_root, &format!("[{}]", branch_name))?);
+    let existing = find_branch_worktree(&repo_root, &branch_name)?;
 
     let mut resume_target = None;
     let mut is_new_worktree = false;
@@ -1332,6 +1471,7 @@ fn run_branch(
     } else {
         let bg_color = pick_available_color(&final_path);
         save_worktree_color(&final_path, &bg_color)?;
+        record_current_iterm_session(&final_path)?;
         let session_name = session_name_from_branch(&branch_name);
 
         // Guard ensures iTerm settings are reset even on Ctrl+C or panic
@@ -1757,6 +1897,7 @@ fn run_new(no_agent: bool, prompt: Option<String>, repo: Option<PathBuf>, agent:
         } else {
             let bg_color = pick_available_color(&new_path);
             save_worktree_color(&new_path, &bg_color)?;
+            record_current_iterm_session(&new_path)?;
             let session_name = session_name_from_branch(&branch_name);
 
             let _iterm_guard = ItermGuard::new(&bg_color, &session_name);
@@ -2001,6 +2142,7 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
             let color_file = worktree_color_file(&wt.path);
             let _ = fs::remove_file(color_file);
             let _ = fs::remove_file(session_name_file(&wt.path));
+            let _ = fs::remove_file(worktree_iterm_session_file(&wt.path));
             remove_session_pid(&wt.path);
             remove_bazel_output_base(&wt.path);
 
@@ -2044,6 +2186,7 @@ fn remove_worktrees(worktrees: &[WorktreeInfo], repo_root: &PathBuf) -> Result<(
                 let color_file = worktree_color_file(&wt.path);
                 let _ = fs::remove_file(color_file);
                 let _ = fs::remove_file(session_name_file(&wt.path));
+                let _ = fs::remove_file(worktree_iterm_session_file(&wt.path));
                 remove_session_pid(&wt.path);
                 remove_bazel_output_base(&wt.path);
 
@@ -4256,6 +4399,7 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
     prepare_agent_worktree(agent, worktree_path, &repo_root)?;
     let bg_color = pick_available_color(worktree_path);
     save_worktree_color(worktree_path, &bg_color)?;
+    record_current_iterm_session(worktree_path)?;
     let session_name = session_name_for_resume(worktree_path, &ws.worktree.branch);
 
     let _iterm_guard = ItermGuard::new(&bg_color, &session_name);
@@ -4351,6 +4495,7 @@ fn run_resume_last(repo: Option<PathBuf>, agent: Agent) -> Result<(), String> {
     prepare_agent_worktree(agent, &worktree_path, &repo_root)?;
     let bg_color = pick_available_color(&worktree_path);
     save_worktree_color(&worktree_path, &bg_color)?;
+    record_current_iterm_session(&worktree_path)?;
     let session_name = session_name_for_resume(&worktree_path, &branch);
 
     let _iterm_guard = ItermGuard::new(&bg_color, &session_name);
@@ -4875,6 +5020,31 @@ mod tests {
         assert!(long.starts_with("darren/statsig-this-is-a-"));
         assert!(session_name_from_branch(&long).len() <= 25);
         assert!(Regex::new(r"-[0-9a-f]{6}$").unwrap().is_match(&long));
+    }
+
+    #[test]
+    fn iterm_session_mappings_use_stable_exact_ids() {
+        assert_eq!(
+            normalized_iterm_session_id("w0t1p0:ABC-123"),
+            Some("ABC-123".to_string())
+        );
+        assert_eq!(
+            normalized_iterm_session_id("ABC-123\n"),
+            Some("ABC-123".to_string())
+        );
+        assert_eq!(normalized_iterm_session_id(""), None);
+
+        let first = resource_iterm_session_file("pr", "42", Path::new("/tmp/repo-a"));
+        let repeated = resource_iterm_session_file("pr", "42", Path::new("/tmp/repo-a"));
+        let other_repo = resource_iterm_session_file("pr", "42", Path::new("/tmp/repo-b"));
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_repo);
+
+        let first_worktree = worktree_iterm_session_file(Path::new("/tmp/repo-a/worktree"));
+        let repeated_worktree = worktree_iterm_session_file(Path::new("/tmp/repo-a/worktree"));
+        let same_name_other_repo = worktree_iterm_session_file(Path::new("/tmp/repo-b/worktree"));
+        assert_eq!(first_worktree, repeated_worktree);
+        assert_ne!(first_worktree, same_name_other_repo);
     }
 
     #[test]
