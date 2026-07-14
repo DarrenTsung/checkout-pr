@@ -7,6 +7,8 @@ A CLI tool for managing git worktrees with Codex and Claude Code integration. It
 - **`checkout pr <number|url>`** — Check out a GitHub PR into a worktree
 - **`checkout statsig <gate>`** — Open a persistent gate-specific worktree and Codex session
 - **`checkout open pr|statsig <id>`** — Focus a matching iTerm tab or open one that resumes/creates the resource session
+- **`checkout open workspace --repo <path>`** — Focus or resume a local workspace's coding session
+- **`checkout session pr|statsig|workspace ...`** — Report whether the resource's exact iTerm session is live
 - **`checkout review <number|url>`** — Check out a PR and start a code review
 - **`checkout branch <name>`** — Create a new branch in a worktree
 - **`checkout new`** — Create or recycle a randomly named worktree
@@ -66,6 +68,8 @@ checkout new --agent claude          # Claude Code
 checkout resume                      # browse Codex and Claude sessions
 checkout open pr 830562              # focus, resume, or create the PR session
 checkout open statsig my_gate        # focus, resume, or create the gate session
+checkout session pr 830562 --json    # check without focusing or opening iTerm
+checkout open workspace --repo .     # focus or resume this workspace
 ```
 
 ## Requirements

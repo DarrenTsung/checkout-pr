@@ -177,6 +177,11 @@ enum Commands {
         #[command(subcommand)]
         target: OpenTarget,
     },
+    /// Check whether a resource has a live iTerm session
+    Session {
+        #[command(subcommand)]
+        target: SessionTarget,
+    },
     /// Open a persistent worktree for a Statsig gate
     Statsig {
         /// Statsig gate name
@@ -306,6 +311,64 @@ enum OpenTarget {
         /// Path to the repo (default: $CHECKOUT_REPO)
         #[arg(long)]
         repo: Option<PathBuf>,
+
+        /// Print a machine-readable result
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open the coding session for a local workspace
+    Workspace {
+        /// Path to the workspace
+        #[arg(long)]
+        repo: PathBuf,
+
+        /// Print a machine-readable result
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionTarget {
+    /// Check for a live GitHub PR session
+    Pr {
+        /// PR number or GitHub PR URL
+        pr: String,
+
+        /// Known PR branch, avoiding another GitHub lookup
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Print a machine-readable result
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check for a live Statsig gate session
+    Statsig {
+        /// Statsig gate name
+        gate: String,
+
+        /// Path to the repo (default: $CHECKOUT_REPO)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Print a machine-readable result
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check or register the coding session for a local workspace
+    Workspace {
+        /// Path to the workspace
+        #[arg(long)]
+        repo: PathBuf,
+
+        /// Associate the current iTerm session with this workspace
+        #[arg(long)]
+        register_current: bool,
 
         /// Print a machine-readable result
         #[arg(long)]
@@ -890,6 +953,16 @@ fn run() -> Result<(), String> {
         Commands::Open { target } => match target {
             OpenTarget::Pr { pr, repo, json } => run_open_pr(&pr, repo, json, agent),
             OpenTarget::Statsig { gate, repo, json } => run_open_statsig(&gate, repo, json, agent),
+            OpenTarget::Workspace { repo, json } => run_open_workspace(repo, json, agent),
+        },
+        Commands::Session { target } => match target {
+            SessionTarget::Pr { pr, branch, repo, json } => {
+                run_session_pr(&pr, branch.as_deref(), repo, json)
+            }
+            SessionTarget::Statsig { gate, repo, json } => run_session_statsig(&gate, repo, json),
+            SessionTarget::Workspace { repo, register_current, json } => {
+                run_session_workspace(repo, register_current, json)
+            }
         },
         Commands::Statsig { gate, repo, resume_existing } => run_statsig(&gate, repo, agent, resume_existing),
         Commands::Walkthrough { pr, no_agent, repo } => run_pr(
@@ -1006,6 +1079,63 @@ struct ItermOpenResult {
     session_id: String,
 }
 
+fn find_live_iterm_session(
+    resource_session_id: Option<&str>,
+    worktree_session_id: Option<&str>,
+    session_name: &str,
+    legacy_prefix: Option<&str>,
+) -> Result<Option<String>, String> {
+    let script = r#"
+on run argv
+    set resourceSessionId to item 1 of argv
+    set worktreeSessionId to item 2 of argv
+    set targetName to item 3 of argv
+    set legacyPrefix to item 4 of argv
+    if application "iTerm2" is not running then return ""
+    tell application "iTerm2"
+        repeat with candidateWindow in windows
+            repeat with candidateTab in tabs of candidateWindow
+                repeat with candidateSession in sessions of candidateTab
+                    set candidateId to id of candidateSession as text
+                    if (resourceSessionId is not "" and candidateId is resourceSessionId) or (worktreeSessionId is not "" and candidateId is worktreeSessionId) then
+                        return candidateId
+                    end if
+                end repeat
+            end repeat
+        end repeat
+
+        repeat with candidateWindow in windows
+            repeat with candidateTab in tabs of candidateWindow
+                repeat with candidateSession in sessions of candidateTab
+                    set candidateName to name of candidateSession
+                    if candidateName is targetName or (legacyPrefix is not "" and candidateName starts with legacyPrefix) then
+                        return id of candidateSession as text
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    return ""
+end run
+"#;
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            script,
+            "--",
+            resource_session_id.unwrap_or(""),
+            worktree_session_id.unwrap_or(""),
+            session_name,
+            legacy_prefix.unwrap_or(""),
+        ])
+        .output()
+        .map_err(|error| format!("Failed to run osascript: {}", error))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(normalized_iterm_session_id(&String::from_utf8_lossy(&output.stdout)))
+}
+
 fn focus_or_open_iterm(
     resource_session_id: Option<&str>,
     worktree_session_id: Option<&str>,
@@ -1107,6 +1237,78 @@ fn print_open_result(json: bool, action: &str, resource: &str, identifier: &str,
     }
 }
 
+fn print_session_result(json: bool, exists: bool, resource: &str, identifier: &str, session_name: &str) {
+    if json {
+        println!("{}", serde_json::json!({
+            "exists": exists,
+            "resourceType": resource,
+            "resourceId": identifier,
+            "sessionName": session_name,
+        }));
+    } else {
+        let state = if exists { "Live".green() } else { "Not running".dimmed() };
+        println!("{} {} {}", "→".blue().bold(), session_name.cyan(), state);
+    }
+}
+
+fn workspace_session_name(repo_root: &Path) -> String {
+    let name = repo_root.file_name().and_then(|value| value.to_str()).unwrap_or("workspace");
+    session_name_from_branch(name)
+}
+
+fn workspace_launch_command(repo_root: &Path, agent: Agent) -> String {
+    let agent_command = match agent {
+        Agent::Codex => "codex resume --last || codex",
+        Agent::Claude => "claude --continue || claude",
+    };
+    format!("cd {} && {}", shell_quote(&repo_root.to_string_lossy()), agent_command)
+}
+
+fn save_live_session(
+    resource: &str,
+    identifier: &str,
+    repo_root: &Path,
+    worktree: Option<&Path>,
+    session_id: &str,
+) -> Result<(), String> {
+    save_resource_iterm_session(resource, identifier, repo_root, session_id)?;
+    if let Some(worktree) = worktree {
+        save_worktree_iterm_session(worktree, session_id)?;
+    }
+    Ok(())
+}
+
+fn clear_stale_session(resource: &str, identifier: &str, repo_root: &Path, worktree: Option<&Path>) {
+    let _ = fs::remove_file(resource_iterm_session_file(resource, identifier, repo_root));
+    if let Some(worktree) = worktree {
+        let _ = fs::remove_file(worktree_iterm_session_file(worktree));
+    }
+}
+
+fn session_status(
+    resource: &str,
+    identifier: &str,
+    repo_root: &Path,
+    worktree: Option<&Path>,
+    session_name: &str,
+    legacy_prefix: Option<&str>,
+) -> Result<bool, String> {
+    let resource_session_id = read_resource_iterm_session(resource, identifier, repo_root);
+    let worktree_session_id = worktree.and_then(read_worktree_iterm_session);
+    let session_id = find_live_iterm_session(
+        resource_session_id.as_deref(),
+        worktree_session_id.as_deref(),
+        session_name,
+        legacy_prefix,
+    )?;
+    if let Some(session_id) = session_id {
+        save_live_session(resource, identifier, repo_root, worktree, &session_id)?;
+        return Ok(true);
+    }
+    clear_stale_session(resource, identifier, repo_root, worktree);
+    Ok(false)
+}
+
 fn find_pr_worktree(
     repo_root: &PathBuf,
     pr_number: u64,
@@ -1180,6 +1382,107 @@ fn run_open_statsig(gate: &str, repo: Option<PathBuf>, json: bool, agent: Agent)
         save_worktree_iterm_session(&worktree, &result.session_id)?;
     }
     print_open_result(json, &result.action, "statsig", gate, &session_name);
+    Ok(())
+}
+
+fn run_open_workspace(repo_root: PathBuf, json: bool, agent: Agent) -> Result<(), String> {
+    if !repo_root.exists() {
+        return Err(format!("Workspace not found at {}", repo_root.display()));
+    }
+    let identifier = "development";
+    let session_name = workspace_session_name(&repo_root);
+    let resource_session_id = read_resource_iterm_session("workspace", identifier, &repo_root);
+    let worktree_session_id = read_worktree_iterm_session(&repo_root);
+    let command = workspace_launch_command(&repo_root, agent);
+    let result = focus_or_open_iterm(
+        resource_session_id.as_deref(),
+        worktree_session_id.as_deref(),
+        &session_name,
+        None,
+        &command,
+    )?;
+    save_live_session("workspace", identifier, &repo_root, Some(&repo_root), &result.session_id)?;
+    print_open_result(json, &result.action, "workspace", identifier, &session_name);
+    Ok(())
+}
+
+fn run_session_pr(
+    pr: &str,
+    branch: Option<&str>,
+    repo: Option<PathBuf>,
+    json: bool,
+) -> Result<(), String> {
+    let pr_number = extract_pr_number(pr)?;
+    let repo_root = repo.unwrap_or_else(default_repo_root);
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+    let branch = match branch {
+        Some(branch) => branch.to_string(),
+        None => fetch_pr_details(pr_number, &repo_root)?.head_ref_name,
+    };
+    let session_name = session_name_from_branch(&branch);
+    let worktree = find_pr_worktree(&repo_root, pr_number, &branch)?;
+    let identifier = pr_number.to_string();
+    let legacy_prefix = format!("pr-{}-", pr_number);
+    let exists = session_status(
+        "pr",
+        &identifier,
+        &repo_root,
+        worktree.as_deref(),
+        &session_name,
+        Some(&legacy_prefix),
+    )?;
+    print_session_result(json, exists, "pr", &identifier, &session_name);
+    Ok(())
+}
+
+fn run_session_statsig(gate: &str, repo: Option<PathBuf>, json: bool) -> Result<(), String> {
+    let gate = gate.trim();
+    if gate.is_empty() {
+        return Err("Statsig gate name is required".to_string());
+    }
+    let repo_root = repo.unwrap_or_else(default_repo_root);
+    if !repo_root.exists() {
+        return Err(format!("Repo not found at {}", repo_root.display()));
+    }
+    let branch = statsig_branch_name(gate);
+    let session_name = session_name_from_branch(&branch);
+    let worktree = find_branch_worktree(&repo_root, &branch)?;
+    let exists = session_status(
+        "statsig",
+        gate,
+        &repo_root,
+        worktree.as_deref(),
+        &session_name,
+        None,
+    )?;
+    print_session_result(json, exists, "statsig", gate, &session_name);
+    Ok(())
+}
+
+fn run_session_workspace(repo_root: PathBuf, register_current: bool, json: bool) -> Result<(), String> {
+    if !repo_root.exists() {
+        return Err(format!("Workspace not found at {}", repo_root.display()));
+    }
+    let identifier = "development";
+    let session_name = workspace_session_name(&repo_root);
+    if register_current {
+        let session_id = env::var("ITERM_SESSION_ID")
+            .map_err(|_| "ITERM_SESSION_ID is not set".to_string())?;
+        save_live_session("workspace", identifier, &repo_root, Some(&repo_root), &session_id)?;
+        print_session_result(json, true, "workspace", identifier, &session_name);
+        return Ok(());
+    }
+    let exists = session_status(
+        "workspace",
+        identifier,
+        &repo_root,
+        Some(&repo_root),
+        &session_name,
+        None,
+    )?;
+    print_session_result(json, exists, "workspace", identifier, &session_name);
     Ok(())
 }
 
@@ -5006,6 +5309,58 @@ mod tests {
             Commands::Open {
                 target: OpenTarget::Statsig { gate, json: true, .. }
             } if gate == "my_gate"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "checkout",
+            "open",
+            "workspace",
+            "--repo",
+            "/tmp/work-dash",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Open {
+                target: OpenTarget::Workspace { repo, json: true }
+            } if repo == PathBuf::from("/tmp/work-dash")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "checkout",
+            "session",
+            "pr",
+            "830562",
+            "--branch",
+            "darren/test",
+            "--repo",
+            "/tmp/figma",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Session {
+                target: SessionTarget::Pr { pr, branch: Some(branch), json: true, .. }
+            } if pr == "830562" && branch == "darren/test"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "checkout",
+            "session",
+            "workspace",
+            "--repo",
+            "/tmp/work-dash",
+            "--register-current",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Session {
+                target: SessionTarget::Workspace { register_current: true, json: true, .. }
+            }
         ));
     }
 
