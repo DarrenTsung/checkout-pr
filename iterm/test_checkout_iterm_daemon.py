@@ -1,6 +1,6 @@
 import unittest
 
-from checkout_iterm_daemon import find_session, open_session
+from checkout_iterm_daemon import find_session, open_session, snapshot_sessions
 
 
 class FakeApp:
@@ -80,6 +80,23 @@ class OpenSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.sent_text, "checkout workspace\n")
         self.assertTrue(session.activated)
         self.assertTrue(app.activated)
+
+
+class SnapshotSessionsTest(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_all_sessions_and_the_current_session(self):
+        first = type("Session", (), {"session_id": "first", "name": "one"})()
+        current = type("Session", (), {"session_id": "current", "name": "two"})()
+        tab = type("Tab", (), {"sessions": [first, current], "current_session": current})()
+        window = type("Window", (), {"tabs": [tab], "current_tab": tab})()
+        app = type("App", (), {"terminal_windows": [window], "current_terminal_window": window})()
+
+        sessions, focused = await snapshot_sessions(app)
+
+        self.assertEqual(sessions, [
+            {"sessionId": "first", "name": "one"},
+            {"sessionId": "current", "name": "two"},
+        ])
+        self.assertEqual(focused, "current")
 
 
 if __name__ == "__main__":

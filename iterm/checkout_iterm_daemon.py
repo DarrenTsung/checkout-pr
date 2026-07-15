@@ -69,6 +69,26 @@ async def open_session(connection, app, session_name, launch_command):
     return session
 
 
+async def snapshot_sessions(app):
+    sessions = []
+    for window in app.terminal_windows:
+        for tab in window.tabs:
+            for session in tab.sessions:
+                sessions.append(
+                    {
+                        "sessionId": session.session_id,
+                        "name": session.name,
+                    }
+                )
+    focused = None
+    window = app.current_terminal_window
+    if window is not None and window.current_tab is not None:
+        current = window.current_tab.current_session
+        if current is not None:
+            focused = current.session_id
+    return sessions, focused
+
+
 async def handle_request(reader, writer, connection, app, aliases, open_locks):
     started = time.perf_counter()
     try:
@@ -79,6 +99,19 @@ async def handle_request(reader, writer, connection, app, aliases, open_locks):
         action = request.get("action")
         if action == "ping":
             writer.write(response(ok=True))
+            await writer.drain()
+            return
+        if action == "snapshot":
+            sessions, focused = await snapshot_sessions(app)
+            writer.write(
+                response(
+                    ok=True,
+                    sessions=sessions,
+                    focusedSessionId=focused,
+                    applicationActive=bool(app.app_active),
+                    elapsedMs=round((time.perf_counter() - started) * 1_000, 2),
+                )
+            )
             await writer.drain()
             return
         if action not in {"status", "focus", "open", "rename"}:
@@ -168,11 +201,17 @@ async def handle_request(reader, writer, connection, app, aliases, open_locks):
         )
         await writer.drain()
     except Exception as error:
-        writer.write(response(ok=False, error=str(error)[:500]))
-        await writer.drain()
+        try:
+            writer.write(response(ok=False, error=str(error)[:500]))
+            await writer.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
     finally:
         writer.close()
-        await writer.wait_closed()
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 async def main(connection):
