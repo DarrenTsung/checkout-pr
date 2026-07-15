@@ -1169,13 +1169,21 @@ fn focus_or_open_iterm(
     Ok(ItermOpenResult { action, session_id })
 }
 
-fn print_open_result(json: bool, action: &str, resource: &str, identifier: &str, session_name: &str) {
+fn print_open_result(
+    json: bool,
+    action: &str,
+    resource: &str,
+    identifier: &str,
+    session_name: &str,
+    session_id: &str,
+) {
     if json {
         println!("{}", serde_json::json!({
             "action": action,
             "resourceType": resource,
             "resourceId": identifier,
             "sessionName": session_name,
+            "sessionId": session_id,
         }));
     } else {
         let verb = if action == "focused" { "Focused" } else { "Opened" };
@@ -1183,13 +1191,21 @@ fn print_open_result(json: bool, action: &str, resource: &str, identifier: &str,
     }
 }
 
-fn print_session_result(json: bool, exists: bool, resource: &str, identifier: &str, session_name: &str) {
+fn print_session_result(
+    json: bool,
+    session_id: Option<&str>,
+    resource: &str,
+    identifier: &str,
+    session_name: &str,
+) {
+    let exists = session_id.is_some();
     if json {
         println!("{}", serde_json::json!({
             "exists": exists,
             "resourceType": resource,
             "resourceId": identifier,
             "sessionName": session_name,
+            "sessionId": session_id,
         }));
     } else {
         let state = if exists { "Live".green() } else { "Not running".dimmed() };
@@ -1238,7 +1254,7 @@ fn session_status(
     worktree: Option<&Path>,
     session_name: &str,
     legacy_prefix: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<Option<String>, String> {
     let resource_session_id = read_resource_iterm_session(resource, identifier, repo_root);
     let worktree_session_id = worktree.and_then(read_worktree_iterm_session);
     let session_id = find_live_iterm_session(
@@ -1249,10 +1265,10 @@ fn session_status(
     )?;
     if let Some(session_id) = session_id {
         save_live_session(resource, identifier, repo_root, worktree, &session_id)?;
-        return Ok(true);
+        return Ok(Some(session_id));
     }
     clear_stale_session(resource, identifier, repo_root, worktree);
-    Ok(false)
+    Ok(None)
 }
 
 fn find_pr_worktree(
@@ -1297,7 +1313,14 @@ fn run_open_pr(pr: &str, repo: Option<PathBuf>, json: bool, agent: Agent) -> Res
     if let Some(worktree) = existing_worktree {
         save_worktree_iterm_session(&worktree, &result.session_id)?;
     }
-    print_open_result(json, &result.action, "pr", &identifier, &session_name);
+    print_open_result(
+        json,
+        &result.action,
+        "pr",
+        &identifier,
+        &session_name,
+        &result.session_id,
+    );
     Ok(())
 }
 
@@ -1327,7 +1350,14 @@ fn run_open_statsig(gate: &str, repo: Option<PathBuf>, json: bool, agent: Agent)
     if let Some(worktree) = existing_worktree {
         save_worktree_iterm_session(&worktree, &result.session_id)?;
     }
-    print_open_result(json, &result.action, "statsig", gate, &session_name);
+    print_open_result(
+        json,
+        &result.action,
+        "statsig",
+        gate,
+        &session_name,
+        &result.session_id,
+    );
     Ok(())
 }
 
@@ -1348,7 +1378,14 @@ fn run_open_workspace(repo_root: PathBuf, json: bool, agent: Agent) -> Result<()
         &command,
     )?;
     save_live_session("workspace", identifier, &repo_root, Some(&repo_root), &result.session_id)?;
-    print_open_result(json, &result.action, "workspace", identifier, &session_name);
+    print_open_result(
+        json,
+        &result.action,
+        "workspace",
+        identifier,
+        &session_name,
+        &result.session_id,
+    );
     Ok(())
 }
 
@@ -1371,7 +1408,7 @@ fn run_session_pr(
     let worktree = find_pr_worktree(&repo_root, pr_number, &branch)?;
     let identifier = pr_number.to_string();
     let legacy_prefix = format!("pr-{}-", pr_number);
-    let exists = session_status(
+    let session_id = session_status(
         "pr",
         &identifier,
         &repo_root,
@@ -1379,7 +1416,13 @@ fn run_session_pr(
         &session_name,
         Some(&legacy_prefix),
     )?;
-    print_session_result(json, exists, "pr", &identifier, &session_name);
+    print_session_result(
+        json,
+        session_id.as_deref(),
+        "pr",
+        &identifier,
+        &session_name,
+    );
     Ok(())
 }
 
@@ -1395,7 +1438,7 @@ fn run_session_statsig(gate: &str, repo: Option<PathBuf>, json: bool) -> Result<
     let branch = statsig_branch_name(gate);
     let session_name = session_name_from_branch(&branch);
     let worktree = find_branch_worktree(&repo_root, &branch)?;
-    let exists = session_status(
+    let session_id = session_status(
         "statsig",
         gate,
         &repo_root,
@@ -1403,7 +1446,7 @@ fn run_session_statsig(gate: &str, repo: Option<PathBuf>, json: bool) -> Result<
         &session_name,
         None,
     )?;
-    print_session_result(json, exists, "statsig", gate, &session_name);
+    print_session_result(json, session_id.as_deref(), "statsig", gate, &session_name);
     Ok(())
 }
 
@@ -1417,10 +1460,18 @@ fn run_session_workspace(repo_root: PathBuf, register_current: bool, json: bool)
         let session_id = env::var("ITERM_SESSION_ID")
             .map_err(|_| "ITERM_SESSION_ID is not set".to_string())?;
         save_live_session("workspace", identifier, &repo_root, Some(&repo_root), &session_id)?;
-        print_session_result(json, true, "workspace", identifier, &session_name);
+        let session_id = normalized_iterm_session_id(&session_id)
+            .ok_or_else(|| "ITERM_SESSION_ID is empty".to_string())?;
+        print_session_result(
+            json,
+            Some(&session_id),
+            "workspace",
+            identifier,
+            &session_name,
+        );
         return Ok(());
     }
-    let exists = session_status(
+    let session_id = session_status(
         "workspace",
         identifier,
         &repo_root,
@@ -1428,7 +1479,13 @@ fn run_session_workspace(repo_root: PathBuf, register_current: bool, json: bool)
         &session_name,
         None,
     )?;
-    print_session_result(json, exists, "workspace", identifier, &session_name);
+    print_session_result(
+        json,
+        session_id.as_deref(),
+        "workspace",
+        identifier,
+        &session_name,
+    );
     Ok(())
 }
 
