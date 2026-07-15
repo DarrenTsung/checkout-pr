@@ -2,7 +2,7 @@ Continue the rollout or investigation for the Statsig gate `{{GATE}}`.
 
 Use {{STATSIG_SKILL}} for live gate state and audit history, and use {{DOCUMENT_SKILL}} as the workflow for all rollout-dossier work. Keep the durable dossier in the shared dtsung repository under `~/figma/dtsung/documents/`; do not create a rollout document in the flag worktree.
 
-Before creating anything, search the shared documents for the exact gate key and identify an existing document whose primary purpose is tracking this gate's rollout. Prefer a document with the gate in its title and an existing rollout journal. If several documents mention the gate, reuse the canonical rollout dossier under the document skill's rules rather than modifying an incidental design or investigation. If no dossier exists, create one through {{DOCUMENT_SKILL}}. Follow that skill's timestamped filename and required `## Workstreams` metadata, selecting the most relevant existing workstream from `~/figma/dtsung/workstreams/`.
+Before creating anything, search the shared documents for the exact gate key and identify an existing document whose primary purpose is tracking this gate's rollout. Prefer a document with the gate in its title and an existing rollout journal. If several documents mention the gate, reuse the canonical rollout dossier under the document skill's rules rather than modifying an incidental design or investigation. If no dossier exists, create one through {{DOCUMENT_SKILL}} and follow that skill's timestamped filename convention.
 
 Read and preserve the dossier if it exists. Preserve human-written text and previous journal entries. Refresh facts that have changed, but append a journal entry only when there is materially new evidence, a decision, an action, or a change in rollout state. Do not create a duplicate dossier or duplicate journal entries on resume.
 
@@ -18,10 +18,6 @@ Build the dossier from verified evidence, not assumptions:
 Keep the document comprehensive but high-level enough that a cold reader can operate the rollout. Use this structure, omitting empty boilerplate but retaining explicit open questions:
 
 # `{{GATE}}` rollout
-
-## Workstreams
-
-- The relevant existing workstream name selected according to the document skill
 
 ## At a glance
 

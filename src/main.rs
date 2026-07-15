@@ -5418,6 +5418,8 @@ mod tests {
         assert!(codex_prompt.contains("~/figma/dtsung/documents/"));
         assert!(codex_prompt.contains("introducing pull request"));
         assert!(codex_prompt.contains("## Rollout journal"));
+        assert!(!codex_prompt.contains("## Workstreams"));
+        assert!(!codex_prompt.contains("~/figma/dtsung/workstreams/"));
         assert!(!codex_prompt.contains("worktree root"));
 
         let claude_prompt = statsig_rollout_prompt("my_gate", Agent::Claude);
