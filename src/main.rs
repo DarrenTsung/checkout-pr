@@ -1492,10 +1492,16 @@ fn run_session_workspace(repo_root: PathBuf, register_current: bool, json: bool)
 const STATSIG_ROLLOUT_PROMPT: &str = include_str!("prompts/statsig-rollout.md");
 
 fn statsig_rollout_prompt(gate: &str, agent: Agent) -> String {
-    STATSIG_ROLLOUT_PROMPT.replace("{{GATE}}", gate).replace(
-        "{{STATSIG_SKILL}}",
-        agent.skill("/statsig-cli", "$statsig-cli"),
-    )
+    STATSIG_ROLLOUT_PROMPT
+        .replace("{{GATE}}", gate)
+        .replace(
+            "{{STATSIG_SKILL}}",
+            agent.skill("/statsig-cli", "$statsig-cli"),
+        )
+        .replace(
+            "{{DOCUMENT_SKILL}}",
+            agent.skill("/darren:document", "$document"),
+        )
 }
 
 fn run_statsig(
@@ -5407,14 +5413,18 @@ mod tests {
     fn statsig_prompt_builds_and_maintains_a_rollout_dossier() {
         let codex_prompt = statsig_rollout_prompt("my_gate", Agent::Codex);
         assert!(codex_prompt.contains("$statsig-cli"));
+        assert!(codex_prompt.contains("$document"));
         assert!(codex_prompt.contains("`my_gate`"));
-        assert!(codex_prompt.contains("statsig-rollout.md"));
+        assert!(codex_prompt.contains("~/figma/dtsung/documents/"));
         assert!(codex_prompt.contains("introducing pull request"));
         assert!(codex_prompt.contains("## Rollout journal"));
+        assert!(!codex_prompt.contains("worktree root"));
 
         let claude_prompt = statsig_rollout_prompt("my_gate", Agent::Claude);
         assert!(claude_prompt.contains("/statsig-cli"));
+        assert!(claude_prompt.contains("/darren:document"));
         assert!(!claude_prompt.contains("$statsig-cli"));
+        assert!(!claude_prompt.contains("$document"));
     }
 
     #[test]
