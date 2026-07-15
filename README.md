@@ -40,13 +40,13 @@ Or, if you're making frequent changes and don't want to reinstall each time:
 
 This adds a shell function that builds from source on each invocation and links the bundled workflows into both Claude and Codex.
 
-For faster `open` and `session` commands, install the persistent iTerm2 Python API helper:
+Install the persistent iTerm2 Python API helper once to enable `open` and `session` commands:
 
 ```sh
 ./iterm/install.sh
 ```
 
-The helper focuses saved iTerm sessions by their exact UUID without scanning tabs. It starts automatically the next time iTerm2 starts; `checkout` falls back to AppleScript when the helper is unavailable or a saved session needs recovery.
+The helper connects once when iTerm2 starts and keeps its live session model in memory. Exact UUID lookup, title recovery, focusing, tab creation, and session renaming all use that connection; `checkout` reports a setup error if the helper is unavailable.
 
 ## Configuration
 

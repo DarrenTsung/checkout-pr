@@ -426,33 +426,15 @@ fn rename_iterm_session(title: &str) -> Result<(), String> {
     let session_uuid = iterm_session_id
         .split_once(':')
         .map_or(iterm_session_id.as_str(), |(_, uuid)| uuid);
-    let script = r#"
-on run argv
-    set targetSessionId to item 1 of argv
-    set newName to item 2 of argv
-    tell application "iTerm2"
-        repeat with w in windows
-            repeat with t in tabs of w
-                repeat with s in sessions of t
-                    if id of s is targetSessionId then
-                        set name of s to newName
-                        return "renamed"
-                    end if
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    error "iTerm2 session not found: " & targetSessionId
-end run
-"#;
-    let output = Command::new("osascript")
-        .args(["-e", script, "--", session_uuid, title])
-        .output()
-        .map_err(|e| format!("Failed to run osascript: {}", e))?;
-    if output.status.success() {
+    let response = iterm_api_request(&serde_json::json!({
+        "action": "rename",
+        "sessionIds": [session_uuid],
+        "title": title,
+    }))?;
+    if response.exists == Some(true) {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(format!("iTerm2 session not found: {}", session_uuid))
     }
 }
 
@@ -651,41 +633,53 @@ fn iterm_api_socket_file() -> PathBuf {
     PathBuf::from(format!("{}/.local/share/checkout/iterm-api.sock", home))
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ItermApiResponse {
     ok: bool,
     exists: Option<bool>,
     session_id: Option<String>,
+    action: Option<String>,
+    error: Option<String>,
 }
 
-fn iterm_api_session(action: &str, session_ids: &[&str]) -> Option<String> {
-    iterm_api_session_at(&iterm_api_socket_file(), action, session_ids)
+fn iterm_api_request(request: &Value) -> Result<ItermApiResponse, String> {
+    iterm_api_request_at(&iterm_api_socket_file(), request)
 }
 
-fn iterm_api_session_at(socket_path: &Path, action: &str, session_ids: &[&str]) -> Option<String> {
-    let session_ids = session_ids
-        .iter()
-        .filter(|value| !value.is_empty())
-        .copied()
-        .collect::<Vec<_>>();
-    if session_ids.is_empty() {
-        return None;
-    }
-    let mut stream = UnixStream::connect(socket_path).ok()?;
+fn iterm_api_request_at(socket_path: &Path, request: &Value) -> Result<ItermApiResponse, String> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+        format!(
+            "iTerm Python API helper is unavailable: {}. Run checkout-pr/iterm/install.sh and restart iTerm2",
+            error
+        )
+    })?;
     let timeout = Some(Duration::from_millis(500));
-    stream.set_read_timeout(timeout).ok()?;
-    stream.set_write_timeout(timeout).ok()?;
-    let request = serde_json::json!({ "action": action, "sessionIds": session_ids });
-    stream.write_all(request.to_string().as_bytes()).ok()?;
-    stream.write_all(b"\n").ok()?;
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|error| format!("Failed to configure iTerm Python API helper: {}", error))?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|error| format!("Failed to configure iTerm Python API helper: {}", error))?;
+    stream
+        .write_all(request.to_string().as_bytes())
+        .map_err(|error| format!("Failed to write to iTerm Python API helper: {}", error))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|error| format!("Failed to write to iTerm Python API helper: {}", error))?;
     let mut output = String::new();
-    stream.read_to_string(&mut output).ok()?;
-    let response: ItermApiResponse = serde_json::from_str(output.trim()).ok()?;
-    (response.ok && response.exists == Some(true))
-        .then_some(response.session_id)
-        .flatten()
-        .and_then(|value| normalized_iterm_session_id(&value))
+    stream
+        .read_to_string(&mut output)
+        .map_err(|error| format!("Failed to read from iTerm Python API helper: {}", error))?;
+    let response: ItermApiResponse = serde_json::from_str(output.trim())
+        .map_err(|error| format!("iTerm Python API helper returned invalid JSON: {}", error))?;
+    if !response.ok {
+        return Err(response
+            .error
+            .clone()
+            .unwrap_or_else(|| "iTerm Python API request failed".to_string()));
+    }
+    Ok(response)
 }
 
 fn normalized_iterm_session_id(value: &str) -> Option<String> {
@@ -1128,64 +1122,23 @@ fn find_live_iterm_session(
     session_name: &str,
     legacy_prefix: Option<&str>,
 ) -> Result<Option<String>, String> {
-    if let Some(session_id) = iterm_api_session(
-        "status",
-        &[
+    let response = iterm_api_request(&serde_json::json!({
+        "action": "status",
+        "sessionIds": [
             resource_session_id.unwrap_or(""),
             worktree_session_id.unwrap_or(""),
         ],
-    ) {
-        return Ok(Some(session_id));
+        "sessionName": session_name,
+        "legacyPrefix": legacy_prefix.unwrap_or(""),
+    }))?;
+    if response.exists != Some(true) {
+        return Ok(None);
     }
-    let script = r#"
-on run argv
-    set resourceSessionId to item 1 of argv
-    set worktreeSessionId to item 2 of argv
-    set targetName to item 3 of argv
-    set legacyPrefix to item 4 of argv
-    if application "iTerm2" is not running then return ""
-    tell application "iTerm2"
-        repeat with candidateWindow in windows
-            repeat with candidateTab in tabs of candidateWindow
-                repeat with candidateSession in sessions of candidateTab
-                    set candidateId to id of candidateSession as text
-                    if (resourceSessionId is not "" and candidateId is resourceSessionId) or (worktreeSessionId is not "" and candidateId is worktreeSessionId) then
-                        return candidateId
-                    end if
-                end repeat
-            end repeat
-        end repeat
-
-        repeat with candidateWindow in windows
-            repeat with candidateTab in tabs of candidateWindow
-                repeat with candidateSession in sessions of candidateTab
-                    set candidateName to name of candidateSession
-                    if candidateName is targetName or (legacyPrefix is not "" and candidateName starts with legacyPrefix) then
-                        return id of candidateSession as text
-                    end if
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    return ""
-end run
-"#;
-    let output = Command::new("osascript")
-        .args([
-            "-e",
-            script,
-            "--",
-            resource_session_id.unwrap_or(""),
-            worktree_session_id.unwrap_or(""),
-            session_name,
-            legacy_prefix.unwrap_or(""),
-        ])
-        .output()
-        .map_err(|error| format!("Failed to run osascript: {}", error))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    Ok(normalized_iterm_session_id(&String::from_utf8_lossy(&output.stdout)))
+    let session_id = response
+        .session_id
+        .and_then(|value| normalized_iterm_session_id(&value))
+        .ok_or_else(|| "iTerm Python API helper returned an empty session ID".to_string())?;
+    Ok(Some(session_id))
 }
 
 fn focus_or_open_iterm(
@@ -1195,96 +1148,25 @@ fn focus_or_open_iterm(
     legacy_prefix: Option<&str>,
     launch_command: &str,
 ) -> Result<ItermOpenResult, String> {
-    if let Some(session_id) = iterm_api_session(
-        "focus",
-        &[
+    let response = iterm_api_request(&serde_json::json!({
+        "action": "open",
+        "sessionIds": [
             resource_session_id.unwrap_or(""),
             worktree_session_id.unwrap_or(""),
         ],
-    ) {
-        return Ok(ItermOpenResult {
-            action: "focused".to_string(),
-            session_id,
-        });
-    }
-    let script = r#"
-on run argv
-    set resourceSessionId to item 1 of argv
-    set worktreeSessionId to item 2 of argv
-    set targetName to item 3 of argv
-    set legacyPrefix to item 4 of argv
-    set launchCommand to item 5 of argv
-    tell application "iTerm2"
-        repeat with candidateWindow in windows
-            repeat with candidateTab in tabs of candidateWindow
-                repeat with candidateSession in sessions of candidateTab
-                    set candidateId to id of candidateSession as text
-                    if (resourceSessionId is not "" and candidateId is resourceSessionId) or (worktreeSessionId is not "" and candidateId is worktreeSessionId) then
-                        select candidateSession
-                        select candidateTab
-                        select candidateWindow
-                        activate
-                        return "focused|" & candidateId
-                    end if
-                end repeat
-            end repeat
-        end repeat
-
-        repeat with candidateWindow in windows
-            repeat with candidateTab in tabs of candidateWindow
-                repeat with candidateSession in sessions of candidateTab
-                    set candidateName to name of candidateSession
-                    if candidateName is targetName or (legacyPrefix is not "" and candidateName starts with legacyPrefix) then
-                        select candidateSession
-                        select candidateTab
-                        select candidateWindow
-                        activate
-                        return "focused|" & (id of candidateSession as text)
-                    end if
-                end repeat
-            end repeat
-        end repeat
-
-        if (count of windows) is 0 then
-            set targetWindow to (create window with default profile)
-            set targetSession to current session of targetWindow
-        else
-            set targetWindow to current window
-            tell targetWindow
-                set targetTab to (create tab with default profile)
-            end tell
-            set targetSession to current session of targetTab
-        end if
-        tell targetSession to write text launchCommand
-        activate
-        return "opened|" & (id of targetSession as text)
-    end tell
-end run
-"#;
-    let output = Command::new("osascript")
-        .args([
-            "-e",
-            script,
-            "--",
-            resource_session_id.unwrap_or(""),
-            worktree_session_id.unwrap_or(""),
-            session_name,
-            legacy_prefix.unwrap_or(""),
-            launch_command,
-        ])
-        .output()
-        .map_err(|error| format!("Failed to run osascript: {}", error))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let (action, session_id) = stdout
-        .trim()
-        .split_once('|')
-        .ok_or_else(|| format!("iTerm returned an invalid open result: {}", stdout.trim()))?;
-    let session_id = normalized_iterm_session_id(session_id)
-        .ok_or_else(|| "iTerm returned an empty session ID".to_string())?;
-    Ok(ItermOpenResult { action: action.to_string(), session_id })
+        "sessionName": session_name,
+        "legacyPrefix": legacy_prefix.unwrap_or(""),
+        "launchCommand": launch_command,
+    }))?;
+    let action = response
+        .action
+        .filter(|action| action == "focused" || action == "opened")
+        .ok_or_else(|| "iTerm Python API helper returned an invalid action".to_string())?;
+    let session_id = response
+        .session_id
+        .and_then(|value| normalized_iterm_session_id(&value))
+        .ok_or_else(|| "iTerm Python API helper returned an empty session ID".to_string())?;
+    Ok(ItermOpenResult { action, session_id })
 }
 
 fn print_open_result(json: bool, action: &str, resource: &str, identifier: &str, session_name: &str) {
@@ -5467,7 +5349,7 @@ mod tests {
     }
 
     #[test]
-    fn iterm_api_client_uses_exact_session_ids() {
+    fn iterm_api_client_sends_full_resource_context() {
         let socket_path =
             env::temp_dir().join(format!("checkout-iterm-api-{}.sock", std::process::id()));
         let _ = fs::remove_file(&socket_path);
@@ -5478,23 +5360,50 @@ mod tests {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(request["action"], "focus");
+            assert_eq!(request["action"], "open");
             assert_eq!(
                 request["sessionIds"],
                 serde_json::json!(["ABC-123", "DEF-456"])
             );
+            assert_eq!(request["sessionName"], "work-dash");
+            assert_eq!(request["launchCommand"], "checkout workspace");
             let mut stream = reader.into_inner();
             stream
-                .write_all(b"{\"ok\":true,\"exists\":true,\"sessionId\":\"ABC-123\"}\n")
+                .write_all(b"{\"ok\":true,\"exists\":true,\"sessionId\":\"ABC-123\",\"action\":\"focused\"}\n")
                 .unwrap();
         });
 
-        assert_eq!(
-            iterm_api_session_at(&socket_path, "focus", &["ABC-123", "", "DEF-456"]),
-            Some("ABC-123".to_string())
-        );
+        let response = iterm_api_request_at(
+            &socket_path,
+            &serde_json::json!({
+                "action": "open",
+                "sessionIds": ["ABC-123", "DEF-456"],
+                "sessionName": "work-dash",
+                "launchCommand": "checkout workspace",
+            }),
+        )
+        .unwrap();
+        assert_eq!(response.session_id.as_deref(), Some("ABC-123"));
+        assert_eq!(response.action.as_deref(), Some("focused"));
         server.join().unwrap();
         fs::remove_file(socket_path).unwrap();
+    }
+
+    #[test]
+    fn iterm_api_client_reports_missing_helper() {
+        let socket_path = env::temp_dir().join(format!(
+            "checkout-missing-iterm-api-{}.sock",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&socket_path);
+
+        let error = iterm_api_request_at(
+            &socket_path,
+            &serde_json::json!({ "action": "status", "sessionIds": [] }),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("iTerm Python API helper is unavailable"));
     }
 
     #[test]
