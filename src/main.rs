@@ -1489,16 +1489,34 @@ fn run_session_workspace(repo_root: PathBuf, register_current: bool, json: bool)
     Ok(())
 }
 
-fn run_statsig(gate: &str, repo: Option<PathBuf>, agent: Agent, resume_existing: bool) -> Result<(), String> {
+const STATSIG_ROLLOUT_PROMPT: &str = include_str!("prompts/statsig-rollout.md");
+
+fn statsig_rollout_prompt(gate: &str, agent: Agent) -> String {
+    STATSIG_ROLLOUT_PROMPT.replace("{{GATE}}", gate).replace(
+        "{{STATSIG_SKILL}}",
+        agent.skill("/statsig-cli", "$statsig-cli"),
+    )
+}
+
+fn run_statsig(
+    gate: &str,
+    repo: Option<PathBuf>,
+    agent: Agent,
+    resume_existing: bool,
+) -> Result<(), String> {
     let gate = gate.trim();
     if gate.is_empty() {
         return Err("Statsig gate name is required".to_string());
     }
-    let prompt = format!(
-        "Use $statsig-cli to inspect the Statsig gate `{}` and continue the rollout or investigation associated with it. Verify the current gate state and recent history before recommending or making changes.",
-        gate,
-    );
-    run_branch(&statsig_branch_name(gate), false, Some(prompt), repo, agent, resume_existing)
+    let prompt = statsig_rollout_prompt(gate, agent);
+    run_branch(
+        &statsig_branch_name(gate),
+        false,
+        Some(prompt),
+        repo,
+        agent,
+        resume_existing,
+    )
 }
 
 fn run_pr(
@@ -1643,6 +1661,7 @@ fn run_pr(
             spawn_agent_continue(
                 target.agent,
                 &final_path,
+                None,
                 Some(&system_prompt),
                 target.resume_id.as_deref(),
                 &session_name,
@@ -1796,6 +1815,7 @@ fn run_branch(
             spawn_agent_continue(
                 target.agent,
                 &final_path,
+                prompt.as_deref(),
                 Some(&system_prompt),
                 target.resume_id.as_deref(),
                 &session_name,
@@ -4044,6 +4064,7 @@ fn spawn_agent_with_prompt(
 fn spawn_agent_continue(
     agent: Agent,
     worktree_path: &PathBuf,
+    prompt: Option<&str>,
     developer_instructions: Option<&str>,
     session_id: Option<&str>,
     session_name: &str,
@@ -4051,7 +4072,7 @@ fn spawn_agent_continue(
     spawn_agent_process(
         agent,
         worktree_path,
-        None,
+        prompt,
         developer_instructions,
         session_id,
         true,
@@ -4720,6 +4741,7 @@ fn run_resume(repo: Option<PathBuf>) -> Result<(), String> {
     spawn_agent_continue(
         agent,
         worktree_path,
+        None,
         Some(&developer_instructions),
         ws.session.resume_id.as_deref(),
         &session_name,
@@ -4824,6 +4846,7 @@ fn run_resume_last(repo: Option<PathBuf>, agent: Agent) -> Result<(), String> {
     spawn_agent_continue(
         agent,
         &worktree_path,
+        None,
         Some(&system_prompt),
         resume_id.as_deref(),
         &session_name,
@@ -5381,6 +5404,20 @@ mod tests {
     }
 
     #[test]
+    fn statsig_prompt_builds_and_maintains_a_rollout_dossier() {
+        let codex_prompt = statsig_rollout_prompt("my_gate", Agent::Codex);
+        assert!(codex_prompt.contains("$statsig-cli"));
+        assert!(codex_prompt.contains("`my_gate`"));
+        assert!(codex_prompt.contains("statsig-rollout.md"));
+        assert!(codex_prompt.contains("introducing pull request"));
+        assert!(codex_prompt.contains("## Rollout journal"));
+
+        let claude_prompt = statsig_rollout_prompt("my_gate", Agent::Claude);
+        assert!(claude_prompt.contains("/statsig-cli"));
+        assert!(!claude_prompt.contains("$statsig-cli"));
+    }
+
+    #[test]
     fn iterm_session_mappings_use_stable_exact_ids() {
         assert_eq!(
             normalized_iterm_session_id("w0t1p0:ABC-123"),
@@ -5633,7 +5670,7 @@ mod tests {
         assert_eq!(
             build_agent_args(
                 Agent::Codex,
-                None,
+                Some("refresh the rollout dossier"),
                 Some("protect the worktree"),
                 true,
                 Some("019f4918-33a8-7542-96cf-cfcfb2886c75"),
@@ -5644,6 +5681,7 @@ mod tests {
                 "developer_instructions=\"protect the worktree\"",
                 "resume",
                 "019f4918-33a8-7542-96cf-cfcfb2886c75",
+                "refresh the rollout dossier",
             ]
         );
     }

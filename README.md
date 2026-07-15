@@ -5,7 +5,7 @@ A CLI tool for managing git worktrees with Codex and Claude Code integration. It
 ## Features
 
 - **`checkout pr <number|url>`** — Check out a GitHub PR into a worktree
-- **`checkout statsig <gate>`** — Open a persistent gate-specific worktree and Codex session
+- **`checkout statsig <gate>`** — Open a persistent gate-specific worktree and agent session, with a living `statsig-rollout.md` dossier assembled from Statsig, the introducing PR, code, and rollout signals
 - **`checkout open pr|statsig <id>`** — Focus a matching iTerm tab or open one that resumes/creates the resource session
 - **`checkout open workspace --repo <path>`** — Focus or resume a local workspace's coding session
 - **`checkout session pr|statsig|workspace ...`** — Report whether the resource's exact iTerm session is live
