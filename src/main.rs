@@ -15,7 +15,8 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -645,6 +646,48 @@ fn resource_iterm_session_file(resource: &str, identifier: &str, repo_root: &Pat
     get_session_dir().join(format!("resource-{}.iterm", digest))
 }
 
+fn iterm_api_socket_file() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(format!("{}/.local/share/checkout/iterm-api.sock", home))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItermApiResponse {
+    ok: bool,
+    exists: Option<bool>,
+    session_id: Option<String>,
+}
+
+fn iterm_api_session(action: &str, session_ids: &[&str]) -> Option<String> {
+    iterm_api_session_at(&iterm_api_socket_file(), action, session_ids)
+}
+
+fn iterm_api_session_at(socket_path: &Path, action: &str, session_ids: &[&str]) -> Option<String> {
+    let session_ids = session_ids
+        .iter()
+        .filter(|value| !value.is_empty())
+        .copied()
+        .collect::<Vec<_>>();
+    if session_ids.is_empty() {
+        return None;
+    }
+    let mut stream = UnixStream::connect(socket_path).ok()?;
+    let timeout = Some(Duration::from_millis(500));
+    stream.set_read_timeout(timeout).ok()?;
+    stream.set_write_timeout(timeout).ok()?;
+    let request = serde_json::json!({ "action": action, "sessionIds": session_ids });
+    stream.write_all(request.to_string().as_bytes()).ok()?;
+    stream.write_all(b"\n").ok()?;
+    let mut output = String::new();
+    stream.read_to_string(&mut output).ok()?;
+    let response: ItermApiResponse = serde_json::from_str(output.trim()).ok()?;
+    (response.ok && response.exists == Some(true))
+        .then_some(response.session_id)
+        .flatten()
+        .and_then(|value| normalized_iterm_session_id(&value))
+}
+
 fn normalized_iterm_session_id(value: &str) -> Option<String> {
     let id = value.rsplit_once(':').map_or(value, |(_, id)| id).trim();
     (!id.is_empty()).then(|| id.to_string())
@@ -1085,6 +1128,15 @@ fn find_live_iterm_session(
     session_name: &str,
     legacy_prefix: Option<&str>,
 ) -> Result<Option<String>, String> {
+    if let Some(session_id) = iterm_api_session(
+        "status",
+        &[
+            resource_session_id.unwrap_or(""),
+            worktree_session_id.unwrap_or(""),
+        ],
+    ) {
+        return Ok(Some(session_id));
+    }
     let script = r#"
 on run argv
     set resourceSessionId to item 1 of argv
@@ -1143,6 +1195,18 @@ fn focus_or_open_iterm(
     legacy_prefix: Option<&str>,
     launch_command: &str,
 ) -> Result<ItermOpenResult, String> {
+    if let Some(session_id) = iterm_api_session(
+        "focus",
+        &[
+            resource_session_id.unwrap_or(""),
+            worktree_session_id.unwrap_or(""),
+        ],
+    ) {
+        return Ok(ItermOpenResult {
+            action: "focused".to_string(),
+            session_id,
+        });
+    }
     let script = r#"
 on run argv
     set resourceSessionId to item 1 of argv
@@ -5400,6 +5464,37 @@ mod tests {
         let same_name_other_repo = worktree_iterm_session_file(Path::new("/tmp/repo-b/worktree"));
         assert_eq!(first_worktree, repeated_worktree);
         assert_ne!(first_worktree, same_name_other_repo);
+    }
+
+    #[test]
+    fn iterm_api_client_uses_exact_session_ids() {
+        let socket_path =
+            env::temp_dir().join(format!("checkout-iterm-api-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&socket_path);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["action"], "focus");
+            assert_eq!(
+                request["sessionIds"],
+                serde_json::json!(["ABC-123", "DEF-456"])
+            );
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(b"{\"ok\":true,\"exists\":true,\"sessionId\":\"ABC-123\"}\n")
+                .unwrap();
+        });
+
+        assert_eq!(
+            iterm_api_session_at(&socket_path, "focus", &["ABC-123", "", "DEF-456"]),
+            Some("ABC-123".to_string())
+        );
+        server.join().unwrap();
+        fs::remove_file(socket_path).unwrap();
     }
 
     #[test]

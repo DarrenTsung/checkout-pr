@@ -40,6 +40,14 @@ Or, if you're making frequent changes and don't want to reinstall each time:
 
 This adds a shell function that builds from source on each invocation and links the bundled workflows into both Claude and Codex.
 
+For faster `open` and `session` commands, install the persistent iTerm2 Python API helper:
+
+```sh
+./iterm/install.sh
+```
+
+The helper focuses saved iTerm sessions by their exact UUID without scanning tabs. It starts automatically the next time iTerm2 starts; `checkout` falls back to AppleScript when the helper is unavailable or a saved session needs recovery.
+
 ## Configuration
 
 | Environment Variable | Description | Default |
@@ -77,4 +85,4 @@ checkout open workspace --repo .     # focus or resume this workspace
 - [gh](https://cli.github.com/) (GitHub CLI)
 - [Codex CLI](https://developers.openai.com/codex/cli) (default agent)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI (when using `--agent claude`)
-- iTerm2 (for background color differentiation)
+- iTerm2 with Python API support (for terminal integration and background color differentiation)
