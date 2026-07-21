@@ -510,37 +510,14 @@ Spawn a teammate with this prompt:
 
 ### Teammate 14: PR Body Reviewer
 
-Spawn a teammate with this prompt. Pass it the PR body (from the `gh pr view` fetched in Phase 1) and the diff scope.
+Spawn a teammate that invokes the installed `pr-body` skill in **check** mode. Pass the
+live PR body fetched in Phase 1 plus `$SCOPE_LABEL` and `$SCOPE_DIFF_CMD` so it can verify
+claims against the exact review diff.
 
-> You are a PR-body reviewer. Your question is *"does the description give a reviewer and a future operator what they need — and, if this rolls out behind a flag, does it actually prove the rollout is safe?"*. You review the **PR body text**, cross-checked against the diff. You are NOT a code reviewer; other teammates cover the code.
->
-> The standard is the template at `~/figma/dtsung/templates/pr-body-template.md` (read it). Hold a body to that bar. **This is a check, not a finding generator — only emit a finding when something the template asks for is missing or inadequate.** A clean, well-documented body produces zero findings.
->
-> **Every PR — the light bar.** Flag only if absent:
-> - **Context** — the why; a reviewer with no context should understand the motivation.
-> - **Test plan** — says more than "CI green"; names what behavior the tests prove (and how — TDD/mutation/manual verification).
->
-> **If the PR is flag-gated / staged** (infer from the diff: LaunchDarkly/Statsig gate evals, `*_shadow`/`*_enforce`-style env, percentage ramps), also check the **Feature flags** and **Rollout** sections, and flag what's missing or hand-wavy:
-> - **Feature flags:** each flag's name, system, default, what flipping it does, eval sites, and whether rollback is immediate or has nuances (e.g. requires a deploy, or is frozen at provision so a flip only affects new instances).
-> - **Rollout story** — this is the load-bearing section. The body should walk the steps (merge → validate metrics/logs → flip flag per env → validate again) and explain **how exactly the named metrics and logs prove it's safe to flip AND would catch any error that occurs.** Pressure-test that claim against the diff:
->   - Is each referenced metric/log **actually emitted by this diff** (or already existing) **and reaching Datadog**? A go/no-go signal that depends on a metric that doesn't fire can't prove anything — that's a **Fix / merge blocker**, not a follow-up.
->   - Is the signal **sliced** (by caller / workload / route) so a consumer the author didn't anticipate surfaces as its own failing cohort instead of hiding in an aggregate? (An unsliced auth-fail floor told us *something* was failing but not that it was the make-generic preview WS — that attribution needed `workload_name` on the metric, and the miss became #802079.)
->   - Would it actually **catch errors**, including the ones a metric misses on its own — a consumer that fails *silently* (e.g. a preview that just goes dark needs a success-rate signal, not an error count) and a **low-frequency** consumer that may never run during the shadow window (e.g. a batch/publishing workload that boots, bootstraps, and never prompts)? If the rollout story leans entirely on a metric that wouldn't surface those, say so.
->
-> **The cold-reader bar.** A PR body is read by someone who has only the PR and the diff — none of the discussion that produced it. Iterating on a body with the author silently bakes in that familiarity; flag what a stranger can't resolve. This is about substantive comprehension, not cosmetics — only flag where the clutter genuinely impairs an unfamiliar reader:
-> - **Assumed-familiarity shorthand** — phrases that only parse if you were in the authoring discussion ("checkable per-cohort", "the gate we discussed"). Suggest a rewrite stating the *what* and *why* in plain words.
-> - **Internal cross-references** — "see Feature flags", "as mentioned above"; the point should be made where it's needed.
-> - **Implementation plumbing a reader doesn't need** — *how* a value is wired ("threaded via `workspace/create` BootstrapConfig") when the behavior and its consequence are what matter.
-> - **Unresolvable references** — local file paths (`~/figma/...`), Slack channels (`#feat-...`), internal tooling/process vocabulary (`checkout-review`, "triage", classification codes). Inline the content or cut it. Real repo identifiers and file/function names are fine — those are greppable domain vocabulary, NOT clutter.
-> - **Disclaimers / hedging / self-justifying clutter** — apologetic or meta commentary about the author's confidence or process, editorial parentheticals like "(I'm owning these)". State things as fact.
-> - **Redundancy from iteration** — the same go/no-go criterion or rationale restated across several sections because edits piled up. Each idea should appear once, where a reader looks for it.
-> - **Dense paragraphs that should be bullets** — a paragraph packing several distinct facts is hard to scan. When the body describes several items of the same kind (multiple flags, logs, metrics, rollout steps), each should get the *same* fixed shape: a **bolded label** + a short non-bold blurb. Flag a multi-fact paragraph that should be a bullet list, and parallel items (e.g. two flags, two log lines) that don't share a structure. Real example: a flag written as one dense paragraph → bullets with fixed labels **System / Eval site / Effect when on / Rollout-rollback**; "both sides log: sboxd `...`, foundry `...`" → one bullet per log.
->
-> Treat cold-reader findings as **Follow-up** by default (they sharpen the body but rarely block merge), unless the clutter actively misleads a reviewer about what the change does — then **Fix**.
->
-> Do NOT flag: pure cosmetic phrasing (word choice, sentence rhythm) that a cold reader follows fine, sections that genuinely don't apply (an ordinary PR has no flags/rollout to document — don't demand them), or detail beyond what an operator would actually need. Prefer **Fix** for a rollout signal that's actually unwired (it blocks a safe flip) and **Follow-up** for documentation gaps that don't block merge.
->
-> Output each finding as: which template section is missing/inadequate, why it matters for *this* PR (reference the diff), and what to add. Include a **Recommendation** (Fix/Follow-up/Ignore with a short reason). If the body meets the bar, output "PR body is adequate."
+This teammate is read-only. It must return the `pr-body` findings in the standard review
+finding format, including a Recommendation with brief reasoning, or `PR body is adequate.`
+It must not invoke reconcile mode, edit the body, append review metadata, or apply a second
+prose policy after `pr-body` returns.
 
 ---
 
@@ -552,7 +529,12 @@ This is **not** redundant with a triage-review workflow's verification. That ste
 
 ### Step 1: Consolidate first
 
-Collect all findings from the Phase 2 teammates and drop the "No issues found" sentinel outputs. Consolidate duplicates **now** (not in Phase 3): if multiple teammates flag the same issue (same file, line within ±3, same substance), merge into one candidate finding and **record which reviewers flagged it** — cross-reviewer agreement is signal the validator should know about. This consolidated list is what gets validated.
+Collect all findings from the Phase 2 teammates and drop every clean sentinel, including
+`No issues found` variants and `PR body is adequate.` Consolidate duplicates **now** (not
+in Phase 3): if multiple teammates flag the same issue (same file, line within ±3, or the
+same PR-body passage/section, and the same substance), merge into one candidate finding and
+**record which reviewers flagged it** — cross-reviewer agreement is signal the validator
+should know about. This consolidated list is what gets validated.
 
 Findings the reviewers marked **Ignore** are still validated because later triage may re-classify recommendations; a refuted Ignore is one less row to read.
 
@@ -564,7 +546,9 @@ If the candidate list exceeds **15** findings, validate the highest-priority 15 
 
 For each candidate finding, run one independent validator using the same general-purpose reviewer capability as above. Dispatch in parallel up to the host's active-agent limit; queue the rest and fill freed slots as validators return. Treat concurrency-limit errors as backpressure, not failure. Each validator is **read-only**: it may inspect files and run non-mutating `git`/`gh` commands (`git blame`, `git show`, `git log`, `gh pr view`) to gather evidence, but must not edit, commit, or switch branches.
 
-Pass each validator the finding (category, `file:line`, description, recommendation, agreeing reviewers), `$SCOPE_LABEL` + `$SCOPE_DIFF_CMD` so it fetches the same diff the reviewers saw, and this prompt:
+For code findings, pass each validator the finding (category, `file:line`, description,
+recommendation, agreeing reviewers), `$SCOPE_LABEL` + `$SCOPE_DIFF_CMD` so it fetches the
+same diff the reviewers saw, and this prompt:
 
 > You are an independent validator. A code-review teammate produced the finding below. Your job is **not** to confirm it — it is to **refute** it. Assume it's a false positive until the code proves otherwise.
 >
@@ -584,10 +568,20 @@ Pass each validator the finding (category, `file:line`, description, recommendat
 >
 > Return strictly this JSON, nothing else: `{ "validated": true | false, "reason": "<one sentence>" }`
 
+For a PR-body finding, use a separate validator contract. Pass the live body, exact quoted
+passage or missing section, recommendation, and the same diff scope. Tell the validator to
+invoke `pr-body` in **check** mode and try to refute the finding against the body and diff:
+confirm the passage still exists, the claimed deficiency is material under the canonical
+template, and the proposed deletion/replacement does not introduce a false claim. It must
+remain read-only and return the same strict JSON verdict. Do not require a code
+`file:line` for a body finding.
+
 ### Step 4: Collect verdicts
 
 - `validated: true` → the finding flows into Phase 3 unchanged.
-- `validated: false` → **dropped** from the Findings list and Summary table. Record it (file:line, recommendation, validator's reason) for the "Validated out" section.
+- `validated: false` → **dropped** from the Findings list and Summary table. Record it
+  (code `file:line` or `PR body: <section>`, recommendation, validator's reason) for the
+  "Validated out" section.
 - **Validator infra failure** (timeout, dispatch error, unparseable output — not a genuine `validated:false`): do **not** drop a **Fix**-recommended finding — keep it and tag `(validation degraded)`. For Follow-up/Ignore, drop with reason "validator failed." A transient failure must never silently delete a finding the reviewer wanted fixed.
 
 Surviving findings — plus any over-budget pass-throughs and degraded Fix findings — are what Phase 3 writes.
@@ -668,7 +662,7 @@ These were flagged by a Phase 2 reviewer but refuted by an independent validator
 Rules:
 - All findings go under a single `## Findings` heading, ordered Fix → Follow-up → Ignore.
 - The `## Validated out` section lists findings dropped in Phase 2.5, behind a collapsed `<details>`. **Omit the section entirely** when nothing was validated out (the common case). Blank lines around the inner markdown are required or GitHub won't render the table inside `<details>`. These rows never appear in the Summary table or Findings list.
-- Each finding's block quote starts with `**Recommendation:** <Fix|Follow-up|Ignore> — <brief reasoning>`, followed by `**Outcome:** N/A`, followed by `[Category] \`file:line\` - description`.
+- Each finding's block quote starts with `**Recommendation:** <Fix|Follow-up|Ignore> — <brief reasoning>`, followed by `**Outcome:** N/A`, followed by `[Category] \`file:line\` - description`. For a PR-body finding, use `[PR Body] PR body: <section> - <description>` instead of inventing a code location.
 - The reasoning should be a short phrase the reader can scan to understand *why* this recommendation fits (e.g., "logic error, will corrupt data", "minor naming preference", "out of scope for this PR").
 - The finding body is a single block quote containing all three lines (Recommendation, Outcome, description).
 - Every `###` finding title and its corresponding summary table row start with a status emoji: ◯ (no outcome), 🟣 (in progress/elaborate), 🟡 (ignored), 🟢 (done/fixed). Initially all are ◯.
