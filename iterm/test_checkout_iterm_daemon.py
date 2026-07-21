@@ -81,6 +81,30 @@ class OpenSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.activated)
         self.assertTrue(app.activated)
 
+    async def test_background_tab_does_not_activate_iterm_or_the_new_session(self):
+        session = FakeSession()
+        tab = type("Tab", (), {"current_session": session})()
+
+        class Window:
+            async def async_create_tab(self):
+                return tab
+
+        class App:
+            current_terminal_window = Window()
+            activated = False
+
+            async def async_activate(self, raise_all_windows):
+                self.activated = True
+
+        app = App()
+        result = await open_session(
+            None, app, "workflow-item", "node runner.js", focus=False
+        )
+
+        self.assertIs(result, session)
+        self.assertFalse(session.activated)
+        self.assertFalse(app.activated)
+
 
 class SnapshotSessionsTest(unittest.IsolatedAsyncioTestCase):
     async def test_returns_all_sessions_and_the_current_session(self):
